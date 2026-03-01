@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: shakti-postgres-test
+    environment:
+      POSTGRES_DB: shakti
+      POSTGRES_USER: shakti
+      POSTGRES_PASSWORD: shakti
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shakti -d shakti"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+{
+  "name": "project-shakti",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:frontend": "node --test frontend/tactical_helpers.test.mjs"
+  }
+}

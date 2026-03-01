@@ -1,0 +1,73 @@
+name: release-gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: shakti
+          POSTGRES_USER: shakti
+          POSTGRES_PASSWORD: shakti
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U shakti -d shakti"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      SHAKTI_TEST_PG_DSN: postgresql://shakti:shakti@127.0.0.1:55432/shakti
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-ci.txt
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..40}; do
+            pg_isready -h 127.0.0.1 -p 55432 -U shakti -d shakti && exit 0
+            sleep 2
+          done
+          echo "PostgreSQL service was not ready in time." >&2
+          exit 1
+
+      - name: Backend unit tests
+        run: python -m pytest backend/tests/test_intelligence_fusion_service.py -q
+
+      - name: Backend full suite
+        run: python -m pytest backend/tests -q
+
+      - name: Frontend tests
+        run: npm run test:frontend

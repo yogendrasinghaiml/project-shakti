@@ -1,0 +1,610 @@
+import { useState, useEffect, useRef } from "react";
+
+const C = {
+  bg: "#020408", panel: "#040b12", card: "#060d14",
+  border: "#0f3050", borderBright: "#1a5a8a",
+  cyan: "#00d4ff", green: "#00ff88", gold: "#ffd700",
+  orange: "#ff6b35", purple: "#a855f7", red: "#ff2244",
+  blue: "#60a5fa", teal: "#34d399",
+  textPrimary: "#e0f0ff", textSec: "#7aadcc", textDim: "#3a6080",
+};
+
+const PHASES = [
+  {
+    id:"P0", title:"MAC VERIFICATION", subtitle:"Confirm your hardware is mission-capable. 5 minutes.", color:C.cyan, icon:"🖥",
+    steps:[
+      { id:"0.1", title:"Open Terminal", type:"action",
+        desc:"Press Cmd + Space → type Terminal → hit Enter. Keep it open for the entire mission.",
+        verify:"Terminal is open and you can type commands." },
+      { id:"0.2", title:"Confirm Apple Silicon (ARM64)", type:"cmd",
+        desc:"MOST CRITICAL CHECK. The entire platform is optimized for Apple Silicon only.",
+        cmd:"uname -m",
+        verify:"✅  Must output exactly:  arm64\n❌  x86_64 means Rosetta is on → Terminal → Get Info → uncheck 'Open using Rosetta'" },
+      { id:"0.3", title:"Confirm macOS Version", type:"cmd",
+        desc:"Requires macOS Sonoma 14.x or Sequoia 15.x.",
+        cmd:"sw_vers",
+        verify:"✅  ProductVersion: 14.x or 15.x\n❌  Older → System Settings → Software Update" },
+      { id:"0.4", title:"Check Free Disk Space (need 30 GB+)", type:"cmd",
+        desc:"MITRE bundle 230MB + models 2GB + ChromaDB grows over time.",
+        cmd:"df -h /",
+        verify:"✅  'Available' column must show > 30G\n❌  Empty Trash, remove large apps if low" },
+      { id:"0.5", title:"Check Free RAM at Idle", type:"cmd",
+        desc:"Need 3 GB+ free before launching anything.",
+        cmd:"vm_stat | grep 'Pages free'",
+        verify:"Multiply the number by 16384 ÷ 1073741824\nExample: 180000 → 180000×16384/1073741824 ≈ 2.7 GB free\n✅  Need > 3 GB free\n❌  Close Chrome, Slack if below 3 GB" },
+    ]
+  },
+  {
+    id:"P1", title:"SYSTEM SETTINGS", subtitle:"One-time macOS config. Do exactly once.", color:C.gold, icon:"⚙",
+    steps:[
+      { id:"1.1", title:"Disable Auto-Updates", type:"action",
+        desc:"Auto-update can restart your Mac mid-operation, killing all 250 agents.",
+        verify:"System Settings → General → Software Update → Automatic Updates → OFF" },
+      { id:"1.2", title:"Prevent Display Sleep", type:"action",
+        desc:"Platform must run through the night without sleeping.",
+        verify:"System Settings → Displays → Advanced → 'Prevent automatic sleeping when display is off' → ON\nSystem Settings → Battery → Options → 'Prevent sleeping when connected to power' → ON" },
+      { id:"1.3", title:"Grant Full Disk Access to Terminal", type:"action",
+        desc:"SQLite and ChromaDB need unrestricted file access.",
+        verify:"System Settings → Privacy & Security → Full Disk Access → Click '+' → Add Terminal.app" },
+      { id:"1.4", title:"Enable Firewall", type:"action",
+        desc:"Block unsolicited inbound connections.",
+        verify:"System Settings → Network → Firewall → Turn On Firewall" },
+      { id:"1.5", title:"Exclude ~/shakti from Spotlight", type:"action",
+        desc:"Prevents macOS indexing intelligence data (burns RAM).",
+        verify:"System Settings → Siri & Spotlight → Spotlight Privacy → '+' → Add ~/shakti folder" },
+      { id:"1.6", title:"Increase File Descriptor Limit", type:"cmd",
+        desc:"Default macOS limit is 256. With 250+ agents you need 65,536.",
+        cmd:"sudo launchctl limit maxfiles 65536 65536\nsudo sh -c 'echo \"limit maxfiles 65536 65536\" >> /etc/launchd.conf'\nulimit -n",
+        verify:"✅  Last command outputs: 65536\n(Enter your Mac password when asked for sudo)" },
+    ]
+  },
+  {
+    id:"P2", title:"HOMEBREW & CORE TOOLS", subtitle:"Install the Mac package manager and all system deps.", color:C.orange, icon:"🍺",
+    steps:[
+      { id:"2.1", title:"Install Homebrew", type:"cmd",
+        desc:"Mac package manager. If already installed, this just updates it.",
+        cmd:'/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+        warn:"Takes 5–10 minutes. Enter your Mac password when asked.",
+        verify:"After install:\nbrew --version\n✅  Should show: Homebrew 4.x.x" },
+      { id:"2.2", title:"Add Homebrew to PATH", type:"cmd",
+        desc:"Required right after install so macOS can find the brew command.",
+        cmd:'eval "$(/opt/homebrew/bin/brew shellenv)"\necho \'eval "$(/opt/homebrew/bin/brew shellenv)"\' >> ~/.zshrc',
+        verify:"✅  which brew\nShould output: /opt/homebrew/bin/brew" },
+      { id:"2.3", title:"Install All System Dependencies", type:"cmd",
+        desc:"One command installs Python, Redis, SQLite, GDAL, and all tools.",
+        cmd:"brew install \\\n  python@3.11 \\\n  redis \\\n  sqlite3 \\\n  gdal \\\n  proj \\\n  git \\\n  curl wget jq \\\n  openssl@3 \\\n  supervisor",
+        warn:"Takes 5–15 minutes. Never run brew installs in parallel on first setup.",
+        verify:"Then verify Python:\nfile $(which python3.11)\n✅  Must show: Mach-O 64-bit executable arm64\n❌  x86_64 → Homebrew is running under Rosetta" },
+      { id:"2.4", title:"Verify Python is Native ARM64", type:"cmd",
+        desc:"CRITICAL — wrong architecture causes silent failures in LLM inference.",
+        cmd:'python3.11 -c "import platform; print(platform.machine())"',
+        verify:"✅  Must print: arm64\n❌  x86_64 → uncheck 'Open using Rosetta' on Terminal → restart Terminal" },
+      { id:"2.5", title:"Add SHAKTI Shell Aliases", type:"cmd",
+        desc:"Convenient shortcuts you'll use every day.",
+        cmd:"cat >> ~/.zshrc << 'ZSHEOF'\nexport SHAKTI_ROOT=\"$HOME/shakti\"\nexport PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:$PATH\"\nexport PYTHONDONTWRITEBYTECODE=1\nexport PYTHONUNBUFFERED=1\nalias shakti=\"cd $SHAKTI_ROOT && source venv/bin/activate\"\nalias shakti-start=\"cd $SHAKTI_ROOT && make start\"\nalias shakti-stop=\"cd $SHAKTI_ROOT && make stop\"\nalias mem=\"vm_stat | awk '/Pages free/{printf \\\"%d MB free\\\\n\\\", int(\\$3)*4096/1048576}'\"\nZSHEOF\nsource ~/.zshrc",
+        verify:"✅  Run: mem\nShould output something like: 3200 MB free" },
+    ]
+  },
+  {
+    id:"P3", title:"OLLAMA & AI MODELS", subtitle:"Install local LLM runtime. Pull exactly the right models.", color:C.purple, icon:"🧠",
+    steps:[
+      { id:"3.1", title:"Install Ollama", type:"cmd",
+        desc:"Local LLM inference engine. Runs 100% on your M2 — zero cloud.",
+        cmd:"curl -fsSL https://ollama.com/install.sh | sh",
+        verify:"✅  ollama --version\nShould show: ollama version 0.4.x or higher" },
+      { id:"3.2", title:"Launch Ollama App", type:"cmd",
+        desc:"Open the Ollama application. Do NOT use 'ollama serve &' in terminal.",
+        cmd:"open /Applications/Ollama.app\nsleep 5\ncurl -s http://localhost:11434/api/tags | jq .",
+        warn:"Ollama must run as an App, not a background process, on 8GB systems.",
+        verify:"✅  Returns JSON (empty models list is fine for now)\n❌  Connection refused → wait 10s, try curl again" },
+      { id:"3.3", title:"Pull Primary Model: llama3.2:1b", type:"cmd",
+        desc:"V3 CRITICAL CHANGE: Use 1b (1.3GB RAM) NOT 3b (2GB). This prevents OOM crashes on 8GB.",
+        cmd:"ollama pull llama3.2:1b",
+        warn:"NEVER pull two models at the same time on 8GB. Wait for this to finish completely.",
+        verify:"Takes 2–5 minutes.\n✅  ollama list | grep llama\nShould show: llama3.2:1b" },
+      { id:"3.4", title:"Wait 10s Then Pull Triage Model", type:"cmd",
+        desc:"phi3:mini is used for SIGINT agents — faster and uses less RAM.",
+        cmd:"sleep 10\nollama pull phi3:mini",
+        verify:"Takes 2–5 minutes.\n✅  ollama list\nShould show BOTH: llama3.2:1b  AND  phi3:mini" },
+      { id:"3.5", title:"Save Model Digests (Version Pinning)", type:"cmd",
+        desc:"Record exact model versions to detect silent Ollama updates.",
+        cmd:"mkdir -p ~/shakti\nollama show llama3.2:1b --format json | jq .digest > ~/shakti_digests.txt\nollama show phi3:mini --format json | jq .digest >> ~/shakti_digests.txt\ncat ~/shakti_digests.txt",
+        verify:"✅  Should show two SHA256 digest strings.\nSave this file — you'll need it in Session 2" },
+      { id:"3.6", title:"Test LLM Works End-to-End", type:"cmd",
+        desc:"Confirm inference is working before building anything on top.",
+        cmd:'ollama run llama3.2:1b "Reply with exactly 3 words: SHAKTI IS ONLINE"',
+        warn:"First run is slower — model loads into memory. 10–30 seconds is normal.",
+        verify:"✅  Should reply with SHAKTI IS ONLINE or similar\n✅  Response time: 5–15 seconds on M2 8GB\n❌  Timeout → restart Ollama app, wait 10s, try again" },
+    ]
+  },
+  {
+    id:"P4", title:"PROJECT STRUCTURE & SECRETS", subtitle:"Create all folders, TLS cert, secrets, download data assets.", color:C.green, icon:"🔐",
+    steps:[
+      { id:"4.1", title:"Create Complete Directory Tree", type:"cmd",
+        desc:"All 20+ directories the platform needs. Run the entire block at once.",
+        cmd:"mkdir -p ~/shakti/{backend,frontend,data,config,logs,tests,models,scripts,archive}\nmkdir -p ~/shakti/backend/{core,agents,api,db}\nmkdir -p ~/shakti/backend/agents/{geoint,cyber,sigint,fusion}\nmkdir -p ~/shakti/data/{chroma_db,sqlite,stix,stac,reports}\nmkdir -p ~/shakti/frontend/libs\nmkdir -p ~/shakti/models/stix\nmkdir -p ~/shakti/config/tls\nls ~/shakti/",
+        verify:"✅  Should see: archive  backend  config  data  frontend  logs  models  scripts  tests" },
+      { id:"4.2", title:"Generate TLS Certificate", type:"cmd",
+        desc:"Encrypts all API traffic even on localhost (Gap #25 fix).",
+        cmd:"openssl req -x509 \\\n  -newkey rsa:4096 \\\n  -keyout ~/shakti/config/tls/server.key \\\n  -out ~/shakti/config/tls/server.crt \\\n  -days 365 -nodes \\\n  -subj \"/C=IN/ST=Delhi/O=SHAKTI-Platform/CN=localhost\"\nchmod 600 ~/shakti/config/tls/server.key\nls -la ~/shakti/config/tls/",
+        verify:"✅  server.key with 600 permissions\n✅  server.crt with 644 permissions" },
+      { id:"4.3", title:"Generate HMAC Platform Secret (Gap #17)", type:"cmd",
+        desc:"32-byte key used to sign every intelligence event. Never share this.",
+        cmd:'python3.11 -c "import secrets; print(secrets.token_hex(32))" > ~/shakti/.platform_secret\nchmod 600 ~/shakti/.platform_secret\necho "Length: $(cat ~/shakti/.platform_secret | wc -c) chars"',
+        verify:"✅  Should say: Length: 65 chars (64 hex + newline)\n✅  Never commit to Git" },
+      { id:"4.4", title:"Generate API Session Token — SAVE THIS", type:"cmd",
+        desc:"The password the HUD uses to authenticate to the backend. COPY AND SAVE IT.",
+        cmd:'python3.11 -c "import secrets; print(secrets.token_hex(32))" > ~/shakti/.session_token\nchmod 600 ~/shakti/.session_token\necho "══════════════ YOUR TOKEN ══════════════"\ncat ~/shakti/.session_token\necho "════════════════════════════════════════"',
+        warn:"SAVE THIS TOKEN. You paste it into the browser when the HUD opens.",
+        verify:"✅  64-character hex string displayed between the lines\n✅  Keep this somewhere safe" },
+      { id:"4.5", title:"Configure Redis", type:"cmd",
+        desc:"Redis is the message bus between agents and the API server.",
+        cmd:"cat > ~/shakti/config/redis.conf << 'EOF'\nmaxmemory 300mb\nmaxmemory-policy allkeys-lru\nsave \"\"\nappendonly no\nloglevel warning\nlogfile /tmp/redis-shakti.log\ntcp-keepalive 60\ntimeout 300\ndatabases 2\nEOF\necho 'Redis config written.'",
+        verify:"✅  No errors shown" },
+      { id:"4.6", title:"Start Redis & Verify", type:"cmd",
+        desc:"Start Redis with your custom config.",
+        cmd:"redis-server ~/shakti/config/redis.conf --daemonize yes\nsleep 2\nredis-cli ping",
+        verify:"✅  Must output: PONG\n❌  Connection refused → wait 3 seconds, try redis-cli ping again" },
+      { id:"4.7", title:"Download MITRE ATT&CK Bundle (~230MB)", type:"cmd",
+        desc:"Cyber threat knowledge base. Downloads once, used forever.",
+        cmd:'curl -L --progress-bar \\\n  -o ~/shakti/models/stix/enterprise-attack.json \\\n  "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"\nwc -c ~/shakti/models/stix/enterprise-attack.json',
+        warn:"Large download — takes 2–5 minutes. Don't interrupt.",
+        verify:"✅  File size > 200,000,000 bytes (200MB+)" },
+      { id:"4.8", title:"Download Frontend Libraries (No CDN)", type:"cmd",
+        desc:"Leaflet maps and marked.js saved locally for sovereignty.",
+        cmd:'curl -o ~/shakti/frontend/libs/leaflet.js "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"\ncurl -o ~/shakti/frontend/libs/leaflet.css "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"\ncurl -o ~/shakti/frontend/libs/marked.min.js "https://cdn.jsdelivr.net/npm/marked/marked.min.js"\nls -lh ~/shakti/frontend/libs/',
+        verify:"✅  All 3 files present and non-zero in ~/shakti/frontend/libs/" },
+    ]
+  },
+  {
+    id:"P5", title:"PYTHON ENVIRONMENT", subtitle:"Isolated venv with all 25+ required packages.", color:C.blue, icon:"🐍",
+    steps:[
+      { id:"5.1", title:"Create Virtual Environment", type:"cmd",
+        desc:"Isolated environment so packages don't conflict with system Python.",
+        cmd:"cd ~/shakti\npython3.11 -m venv venv\nsource venv/bin/activate\npip install --upgrade pip setuptools wheel\necho \"Python: $(python --version)\"",
+        warn:"Every new terminal session: cd ~/shakti && source venv/bin/activate",
+        verify:"✅  Shows Python 3.11.x\n✅  Prompt may show (venv) prefix" },
+      { id:"5.2", title:"Install Web Framework", type:"cmd",
+        desc:"FastAPI, Uvicorn, Pydantic — the API server foundation.",
+        cmd:"pip install \\\n  fastapi==0.109.0 \\\n  \"uvicorn[standard]==0.25.0\" \\\n  uvloop==0.19.0 \\\n  httpx==0.26.0 \\\n  pydantic==2.5.3 \\\n  pydantic-settings==2.1.0 \\\n  python-dotenv==1.0.0",
+        verify:"✅  python3.11 -c 'import fastapi; print(fastapi.__version__)'\nShould print: 0.109.0" },
+      { id:"5.3", title:"Install AI / Agent Framework", type:"cmd",
+        desc:"CrewAI for multi-agent orchestration. LangChain bridge for Ollama.",
+        cmd:"pip install \\\n  crewai==0.28.0 \\\n  \"langchain-openai==0.0.5\" \\\n  openai==1.12.0",
+        warn:"openai package is used ONLY as local client for Ollama's OpenAI-compatible API. Zero cloud calls.",
+        verify:"✅  python3.11 -c 'import crewai; print(crewai.__version__)'\nShould print: 0.28.0" },
+      { id:"5.4", title:"Install Storage Packages", type:"cmd",
+        desc:"ChromaDB vector store, SQLite async driver, Redis client.",
+        cmd:"pip install \\\n  \"chromadb==0.4.22\" \\\n  aiosqlite==0.19.0 \\\n  redis==5.0.1 \\\n  aioredis==2.0.1",
+        verify:"✅  python3.11 -c 'import chromadb; print(chromadb.__version__)'\nShould print: 0.4.22" },
+      { id:"5.5", title:"Install Geospatial Packages", type:"cmd",
+        desc:"Pandas, NumPy, PySTAC, Rasterio for satellite analysis.",
+        cmd:"pip install \\\n  \"pandas==2.1.4\" \\\n  \"numpy==1.26.3\" \\\n  \"pystac==1.8.4\"\npip install rasterio --no-binary rasterio\npython3.11 -c \"import rasterio; print('rasterio', rasterio.__version__, 'OK')\"",
+        warn:"--no-binary flag is critical on Apple Silicon. Without it uses x86 prebuilt binaries.",
+        verify:"✅  Should print: rasterio 1.x.x OK\n❌  GDAL error → run: brew reinstall gdal" },
+      { id:"5.6", title:"Install Intelligence Packages", type:"cmd",
+        desc:"MITRE ATT&CK library, psutil, loguru, uuid7.",
+        cmd:"pip install mitreattack-python==3.0.6\npip install \\\n  \"psutil==5.9.7\" \\\n  \"loguru==0.7.2\" \\\n  \"aiofiles==23.2.1\" \\\n  \"uuid7==0.1.0\"\npython3.11 -c \"from uuid7 import uuid7; print('uuid7 OK:', uuid7())\"",
+        verify:"✅  Should print: uuid7 OK: followed by a UUID string" },
+      { id:"5.7", title:"Install Testing + Freeze Requirements", type:"cmd",
+        desc:"pytest with async support. Freeze all packages.",
+        cmd:"pip install \"pytest==7.4.4\" \"pytest-asyncio==0.23.3\"\npip freeze > ~/shakti/requirements.txt\necho \"Total packages: $(pip list | wc -l)\"",
+        verify:"✅  Should show 50+ packages\n✅  ~/shakti/requirements.txt exists" },
+      { id:"5.8", title:"Create Python Package Markers", type:"cmd",
+        desc:"Makes all subdirectories importable as Python packages.",
+        cmd:"find ~/shakti/backend -type d -exec touch {}/__init__.py \\;\nfind ~/shakti/backend -name '__init__.py' | sort",
+        verify:"✅  Should list ~10 __init__.py files across all backend subdirectories" },
+    ]
+  },
+  {
+    id:"P6", title:"SESSION 1 — CORE CONFIG & SECURITY", subtitle:"Foundation: config, HMAC security, logging, shared async state.", color:C.cyan, icon:"🔒",
+    steps:[
+      { id:"6.1", title:"Create config.py", type:"cmd",
+        desc:"All platform settings in one Pydantic BaseSettings class.",
+        cmd:"cat > ~/shakti/backend/core/config.py << 'PYEOF'\nfrom pydantic_settings import BaseSettings\nfrom pathlib import Path\n\nclass Settings(BaseSettings):\n    SHAKTI_ROOT: str = str(Path.home() / \"shakti\")\n    OLLAMA_BASE_URL: str = \"http://localhost:11434\"\n    OLLAMA_MODEL_PRIMARY: str = \"llama3.2:1b\"\n    OLLAMA_MODEL_TRIAGE: str = \"phi3:mini\"\n    REDIS_URL: str = \"redis://localhost:6379/0\"\n    REDIS_CHANNEL: str = \"shakti:live\"\n    SQLITE_PATH: str = str(Path.home() / \"shakti/data/sqlite/shakti.db\")\n    CHROMA_PATH: str = str(Path.home() / \"shakti/data/chroma_db\")\n    TLS_CERT_PATH: str = str(Path.home() / \"shakti/config/tls/server.crt\")\n    TLS_KEY_PATH: str = str(Path.home() / \"shakti/config/tls/server.key\")\n    MEMORY_CRITICAL_FREE_GB: float = 1.0\n    MEMORY_THROTTLE_FREE_GB: float = 2.0\n    MAX_LLM_CONCURRENT: int = 1\n    AGENT_CYCLE_SECONDS: int = 30\n    LOG_PATH: str = str(Path.home() / \"shakti/logs\")\n\nsettings = Settings()\nPYEOF\ncd ~/shakti && source venv/bin/activate\npython3.11 -c \"from backend.core.config import settings; print('✅ config OK:', settings.OLLAMA_MODEL_PRIMARY)\"",
+        verify:"✅  Should print: config OK: llama3.2:1b" },
+      { id:"6.2", title:"Create security.py", type:"cmd",
+        desc:"HMAC-SHA256 event signing + constant-time token verification.",
+        cmd:"cat > ~/shakti/backend/core/security.py << 'PYEOF'\nimport hmac, hashlib\nfrom pathlib import Path\nfrom loguru import logger\n\nclass SecurityManager:\n    def __init__(self):\n        self._secret = (Path.home()/\"shakti/.platform_secret\").read_text().strip().encode()\n        self._token = (Path.home()/\"shakti/.session_token\").read_text().strip()\n        logger.info(\"SecurityManager initialized\")\n\n    def generate_integrity_hash(self, event_id: str, title: str, ts: str) -> str:\n        payload = f\"{event_id}:{title}:{ts}\".encode()\n        return hmac.new(self._secret, payload, hashlib.sha256).hexdigest()\n\n    def verify_token(self, token: str) -> bool:\n        return hmac.compare_digest(self._token, token)\n\nsecurity_manager = SecurityManager()\nPYEOF\npython3.11 -c \"\nfrom backend.core.security import security_manager\nh = security_manager.generate_integrity_hash('test','Test','2026-01-01')\nprint('✅ HMAC OK:', h[:16]+'...')\nprint('✅ Token reject works:', security_manager.verify_token('wrong')==False)\n\"",
+        verify:"✅  HMAC OK: <16 chars>...\n✅  Token reject works: True" },
+      { id:"6.3", title:"Create state.py — Async Shared State", type:"cmd",
+        desc:"Priority queue, LLM semaphore, startup gates, WebSocket manager with heartbeat.",
+        cmd:"cat > ~/shakti/backend/core/state.py << 'PYEOF'\nimport asyncio, time\nfrom fastapi import WebSocket\nfrom loguru import logger\n\ntask_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=500)\nllm_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)\nsigint_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)\nmodel_lock: asyncio.Lock = asyncio.Lock()\nmodel_ready: asyncio.Event = asyncio.Event()\nollama_online: asyncio.Event = asyncio.Event()\nshutdown_event: asyncio.Event = asyncio.Event()\n\nclass ConnectionManager:\n    def __init__(self):\n        self.active_connections: list[WebSocket] = []\n        self._last_pong: dict[int, float] = {}\n\n    async def connect(self, ws: WebSocket):\n        await ws.accept()\n        self.active_connections.append(ws)\n        self._last_pong[id(ws)] = time.time()\n\n    def disconnect(self, ws: WebSocket):\n        if ws in self.active_connections:\n            self.active_connections.remove(ws)\n        self._last_pong.pop(id(ws), None)\n\n    def record_pong(self, ws: WebSocket):\n        self._last_pong[id(ws)] = time.time()\n\n    async def broadcast(self, message: dict):\n        dead = []\n        for ws in list(self.active_connections):\n            if time.time() - self._last_pong.get(id(ws), time.time()) > 20:\n                dead.append(ws); continue\n            try:\n                await asyncio.wait_for(ws.send_json(message), timeout=3.0)\n            except Exception:\n                dead.append(ws)\n        for ws in dead:\n            self.disconnect(ws)\n\nws_manager = ConnectionManager()\nPYEOF\npython3.11 -c \"\nfrom backend.core.state import llm_semaphore, model_ready, ws_manager\nprint('✅ state.py OK')\nprint('  llm_semaphore:', llm_semaphore._value, '(should be 1)')\nprint('  model_ready:', model_ready.is_set(), '(should be False)')\n\"",
+        verify:"✅  state.py OK\n✅  llm_semaphore: 1\n✅  model_ready: False" },
+    ]
+  },
+  {
+    id:"P7", title:"SESSION 2 — INFERENCE ENGINE", subtitle:"Warmup gate, injection shield, token budget, circuit breaker, degraded fallback.", color:C.purple, icon:"⚡",
+    steps:[
+      { id:"7.1", title:"Create ollama_client.py", type:"cmd",
+        desc:"All LLM calls go through here. Safety gates on every request.",
+        cmd:"cat > ~/shakti/backend/core/ollama_client.py << 'PYEOF'\nimport asyncio, httpx, subprocess, json\nfrom loguru import logger\nfrom backend.core.config import settings\nfrom backend.core import state\n\nINJECTION_PATTERNS = [\n    \"ignore previous\",\"disregard\",\"forget previous\",\"you are now\",\n    \"new persona\",\"act as\",\"system:\",\"assistant:\",\"jailbreak\",\"dan mode\"\n]\n\ndef sanitize_prompt(text: str) -> tuple[str, bool]:\n    was_modified = False\n    lower = text.lower()\n    for p in INJECTION_PATTERNS:\n        if p in lower:\n            text = text.replace(p, \"[REDACTED]\")\n            was_modified = True\n    if was_modified:\n        logger.bind(security_event=\"PROMPT_INJECTION_ATTEMPT\").warning(\"Injection detected\")\n    return text, was_modified\n\nclass PowerStateMonitor:\n    def get_power_state(self) -> str:\n        try:\n            r = subprocess.run([\"pmset\",\"-g\",\"batt\"],capture_output=True,text=True,timeout=2)\n            return \"AC\" if \"AC Power\" in r.stdout else \"BATTERY\"\n        except: return \"AC\"\n    def get_cycle_seconds(self) -> int:\n        return 30 if self.get_power_state()==\"AC\" else 90\n\nclass OllamaModelManager:\n    current_digest: str = \"unknown\"\n    async def warmup(self):\n        logger.info(\"Warming up primary model...\")\n        async with httpx.AsyncClient(timeout=120.0) as client:\n            try:\n                r = await client.post(f\"{settings.OLLAMA_BASE_URL}/api/generate\",\n                    json={\"model\":settings.OLLAMA_MODEL_PRIMARY,\"prompt\":\"reply: SHAKTI_OK\",\"stream\":False})\n                result = r.json().get(\"response\",\"\")\n                if len(result) > 2:\n                    state.model_ready.set()\n                    state.ollama_online.set()\n                    logger.info(\"Model warmup SUCCESS\")\n                else:\n                    logger.error(\"Warmup FAILED\")\n            except Exception as e:\n                logger.error(f\"Warmup error: {e}\")\n\nclass OllamaClient:\n    async def generate(self, model: str, prompt: str,\n                       system_prompt: str=\"\", max_tokens: int=512) -> str:\n        prompt, _ = sanitize_prompt(prompt)\n        if len(prompt) > 6000: prompt = prompt[:6000]+\"\\n[TRUNCATED]\"\n        try:\n            async with state.llm_semaphore:\n                async with httpx.AsyncClient(timeout=30.0) as client:\n                    payload = {\"model\":model,\"prompt\":prompt,\"stream\":False,\n                               \"options\":{\"num_predict\":min(max_tokens,512)}}\n                    if system_prompt: payload[\"system\"] = system_prompt\n                    r = await client.post(f\"{settings.OLLAMA_BASE_URL}/api/generate\",json=payload)\n                    return r.json().get(\"response\",\"\")\n        except asyncio.TimeoutError:\n            state.ollama_online.clear()\n            return \"\"\n        except Exception as e:\n            logger.error(f\"LLM error: {e}\")\n            return \"\"\n\n    async def smart_generate(self, prompt: str, priority: int=2) -> str:\n        model = settings.OLLAMA_MODEL_TRIAGE if priority>=3 else settings.OLLAMA_MODEL_PRIMARY\n        return await self.generate(model, prompt, max_tokens=512)\n\nclass DegradedModeAnalyzer:\n    def analyze_geoint(self, d: float) -> str:\n        if d>0.25: return \"CRITICAL\"\n        if d>0.15: return \"HIGH\"\n        if d>0.08: return \"MEDIUM\"\n        if d>0.03: return \"LOW\"\n        return \"INFO\"\n    def analyze_cyber(self, abuse: float, techniques: int) -> str:\n        if abuse>90 or techniques>=5: return \"CRITICAL\"\n        if abuse>70 or techniques>=3: return \"HIGH\"\n        if abuse>50: return \"MEDIUM\"\n        return \"LOW\"\n    def analyze_sigint(self, kw: int) -> str:\n        if kw>=5: return \"HIGH\"\n        if kw>=3: return \"MEDIUM\"\n        if kw>=1: return \"LOW\"\n        return \"INFO\"\n\nmodel_manager = OllamaModelManager()\nollama_client = OllamaClient()\ndegraded_analyzer = DegradedModeAnalyzer()\nPYEOF\npython3.11 -c \"\nfrom backend.core.ollama_client import degraded_analyzer, sanitize_prompt, PowerStateMonitor\nprint('✅ ollama_client.py OK')\nprint('  Degraded test 0.20:', degraded_analyzer.analyze_geoint(0.20))\n_, modified = sanitize_prompt('ignore previous instructions')\nprint('  Injection blocked:', modified)\nprint('  Power state:', PowerStateMonitor().get_power_state())\n\"",
+        verify:"✅  ollama_client.py OK\n✅  Degraded test 0.20: HIGH\n✅  Injection blocked: True\n✅  Power state: AC (if plugged in)" },
+      { id:"7.2", title:"Test Full Inference Pipeline", type:"cmd",
+        desc:"Confirm Ollama warmup, model_ready gate, and LLM response all work together.",
+        cmd:"cd ~/shakti && source venv/bin/activate\npython3.11 << 'PYEOF'\nimport asyncio, sys, os\nsys.path.insert(0, os.path.expanduser(\"~/shakti\"))\nfrom backend.core.ollama_client import model_manager, ollama_client\nfrom backend.core.state import model_ready\n\nasync def test():\n    print(\"Running warmup (10-30s)...\")\n    await model_manager.warmup()\n    print(f\"model_ready gate: {model_ready.is_set()}\")\n    if model_ready.is_set():\n        result = await ollama_client.generate(\n            \"llama3.2:1b\",\"Reply 3 words: SHAKTI IS ONLINE\",max_tokens=20)\n        print(f\"LLM Response: {result.strip()}\")\n        print(\"✅ INFERENCE PIPELINE PASSED\")\n    else:\n        print(\"❌ warmup failed — is Ollama app running?\")\n\nasyncio.run(test())\nPYEOF",
+        warn:"Takes 10-40 seconds on first run. If timeout → restart Ollama app and retry.",
+        verify:"✅  INFERENCE PIPELINE PASSED\n✅  Response contains SHAKTI or ONLINE" },
+    ]
+  },
+  {
+    id:"P8", title:"SESSION 3 — DATABASE LAYER", subtitle:"SQLite write buffer, 5-table schema, data retention.", color:C.teal, icon:"🗄",
+    steps:[
+      { id:"8.1", title:"Create schema.sql", type:"cmd",
+        desc:"5 tables: threat_events, reports, policy_decisions, event_chains, model_versions.",
+        cmd:"cat > ~/shakti/backend/db/schema.sql << 'EOF'\nCREATE TABLE IF NOT EXISTS threat_events (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  event_id TEXT UNIQUE NOT NULL,\n  cluster TEXT NOT NULL,\n  threat_level TEXT NOT NULL,\n  title TEXT NOT NULL,\n  description TEXT, confidence REAL DEFAULT 0.0,\n  coordinates TEXT, agent_name TEXT,\n  raw_data TEXT, walkthrough TEXT,\n  analysis_mode TEXT DEFAULT 'LLM',\n  model_digest TEXT, integrity_hash TEXT,\n  timestamp_iso TEXT NOT NULL,\n  reviewed_at TEXT, reviewed_by TEXT,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n);\nCREATE TABLE IF NOT EXISTS reports (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  report_id TEXT UNIQUE NOT NULL,\n  fusion_trigger TEXT, report_markdown TEXT NOT NULL,\n  read_status INTEGER DEFAULT 0,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n);\nCREATE TABLE IF NOT EXISTS policy_decisions (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  decision_id TEXT UNIQUE NOT NULL,\n  trigger_event_ids TEXT NOT NULL,\n  rule_name TEXT NOT NULL, escalation_level TEXT NOT NULL,\n  rationale TEXT NOT NULL, data_snapshot TEXT,\n  model_used TEXT, model_confidence REAL,\n  operator_reviewed INTEGER DEFAULT 0,\n  review_timestamp TEXT, review_notes TEXT,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n);\nCREATE TABLE IF NOT EXISTS event_chains (\n  chain_id TEXT PRIMARY KEY, event_ids TEXT NOT NULL,\n  chain_type TEXT NOT NULL, first_seen TEXT NOT NULL,\n  last_seen TEXT NOT NULL, src_ip TEXT, sector TEXT,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n);\nCREATE TABLE IF NOT EXISTS model_versions (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  model_name TEXT NOT NULL, digest TEXT NOT NULL,\n  recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP\n);\nCREATE INDEX IF NOT EXISTS idx_cluster   ON threat_events(cluster);\nCREATE INDEX IF NOT EXISTS idx_level     ON threat_events(threat_level);\nCREATE INDEX IF NOT EXISTS idx_ts        ON threat_events(timestamp_iso);\nCREATE INDEX IF NOT EXISTS idx_event_id  ON threat_events(event_id);\nEOF\ncat ~/shakti/backend/db/schema.sql | grep 'CREATE TABLE' | wc -l",
+        verify:"✅  Should output: 5 (five tables created)" },
+      { id:"8.2", title:"Create database.py", type:"cmd",
+        desc:"DatabaseWriter batches 25 events every 5 seconds. Agents never write directly.",
+        cmd:"cat > ~/shakti/backend/db/database.py << 'PYEOF'\nimport asyncio, aiosqlite\nfrom pathlib import Path\nfrom datetime import datetime, timezone, timedelta\nfrom loguru import logger\nfrom backend.core.config import settings\n\nasync def init_db():\n    db_path = Path(settings.SQLITE_PATH)\n    db_path.parent.mkdir(parents=True, exist_ok=True)\n    schema = Path(__file__).parent / \"schema.sql\"\n    async with aiosqlite.connect(str(db_path)) as db:\n        await db.execute(\"PRAGMA journal_mode=WAL\")\n        await db.execute(\"PRAGMA synchronous=NORMAL\")\n        await db.execute(\"PRAGMA cache_size=10000\")\n        await db.executescript(schema.read_text())\n        await db.commit()\n    logger.info(\"Database initialized\", path=str(db_path))\n\nclass DatabaseWriter:\n    def __init__(self):\n        self.write_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)\n        self._running = False\n\n    async def start(self):\n        self._running = True\n        asyncio.create_task(self._drain_loop())\n\n    async def enqueue(self, result: dict):\n        try: self.write_queue.put_nowait(result)\n        except asyncio.QueueFull: logger.warning(\"Write queue full\")\n\n    async def _drain_loop(self):\n        while self._running:\n            await asyncio.sleep(5)\n            await self._flush_batch()\n\n    async def _flush_batch(self):\n        batch = []\n        while not self.write_queue.empty() and len(batch) < 25:\n            batch.append(self.write_queue.get_nowait())\n        if not batch: return\n        try:\n            async with aiosqlite.connect(settings.SQLITE_PATH) as db:\n                await db.executemany(\n                    \"INSERT OR IGNORE INTO threat_events \"\n                    \"(event_id,cluster,threat_level,title,description,confidence,\"\n                    \"coordinates,agent_name,raw_data,walkthrough,analysis_mode,\"\n                    \"model_digest,integrity_hash,timestamp_iso) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)\",\n                    [(r.get(\"event_id\"),r.get(\"cluster\"),r.get(\"threat_level\"),\n                      r.get(\"title\",\"\"),r.get(\"description\",\"\"),r.get(\"confidence\",0.0),\n                      r.get(\"coordinates\"),r.get(\"agent_name\",\"\"),r.get(\"raw_data\",\"\"),\n                      r.get(\"walkthrough\",\"\"),r.get(\"analysis_mode\",\"LLM\"),\n                      r.get(\"model_digest\",\"\"),r.get(\"integrity_hash\",\"\"),\n                      r.get(\"timestamp_iso\",\"\")) for r in batch])\n                await db.commit()\n            logger.debug(f\"Flushed {len(batch)} events\")\n        except Exception as e:\n            logger.error(f\"DB flush error: {e}\")\n\n    async def stop(self):\n        self._running = False\n        await self._flush_batch()\n\ndb_writer = DatabaseWriter()\nPYEOF\npython3.11 << 'PYEOF'\nimport asyncio\nfrom backend.db.database import init_db, db_writer\nasync def test():\n    await init_db()\n    print('✅ Database initialized')\n    import os; p = os.path.expanduser('~/shakti/data/sqlite/shakti.db')\n    print(f'✅ DB file exists: {os.path.exists(p)}')\nasyncio.run(test())\nPYEOF",
+        verify:"✅  Database initialized\n✅  DB file exists: True" },
+    ]
+  },
+  {
+    id:"P9", title:"SESSIONS 4–8 — AGENT CLUSTERS", subtitle:"Build all 250 agents using Antigravity IDE prompts.", color:C.orange, icon:"🤖",
+    steps:[
+      { id:"9.1", title:"Configure Antigravity IDE", type:"action",
+        desc:"Set up your AI coding environment before writing agent code.",
+        verify:"Open Antigravity IDE → Settings (Cmd+,):\n\nAgent > Behavior > Planning Mode  →  ENABLED\nAgent > Behavior > Artifact Review  →  REQUEST REVIEW\nModel > Primary  →  Claude Sonnet 4.6\nModel > Max Context  →  32000 tokens\n\nMCP > Edit Configuration → paste:\n{\n  \"mcpServers\": {\n    \"shakti-db\": {\n      \"command\": \"/Users/YOURUSERNAME/shakti/venv/bin/python3.11\",\n      \"args\": [\"/Users/YOURUSERNAME/shakti/mcp_server.py\"],\n      \"env\": {\n        \"SHAKTI_DB_PATH\": \"/Users/YOURUSERNAME/shakti/data/sqlite/shakti.db\",\n        \"SHAKTI_ROOT\": \"/Users/YOURUSERNAME/shakti\"\n      }\n    }\n  }\n}\n\nReplace YOURUSERNAME with output of: whoami" },
+      { id:"9.2", title:"Session 4 — Base Agent Prompt", type:"prompt",
+        desc:"Copy this EXACT prompt into Antigravity IDE. Request task list before any files.",
+        cmd:"TASK: Create ~/shakti/backend/agents/base_agent.py\n\nAgentResult dataclass ALL fields required:\n  event_id: str        # str(uuid7())\n  cluster: str         # GEOINT|CYBER|SIGINT|FUSION\n  priority: int        # 1=GEOINT 2=CYBER 3=SIGINT\n  threat_level: str    # INFO|LOW|MEDIUM|HIGH|CRITICAL\n  title: str\n  description: str\n  confidence: float    # 0.0-1.0\n  coordinates: str|None\n  agent_name: str\n  raw_data: str\n  walkthrough: str     # LLM reasoning text\n  analysis_mode: str   # 'LLM' or 'RULE_BASED'\n  model_digest: str\n  integrity_hash: str  # from security_manager.generate_integrity_hash()\n  timestamp_iso: str   # datetime.now(timezone.utc).isoformat()\n\nBaseAgent abstract class:\n  - __init__(agent_id, cluster, priority, ollama_client, db_writer)\n  - abstract async analyze() -> AgentResult\n  - async safe_analyze() wraps analyze() in try/except, returns INFO fallback on error\n  - _build_result(**kwargs) auto-fills event_id, timestamp, integrity_hash\n\nSHOW TASK LIST FIRST. Do not create files until I approve.",
+        verify:"After file is created:\npython3.11 -c 'from backend.agents.base_agent import BaseAgent, AgentResult; print(\"✅ base_agent OK\")'" },
+      { id:"9.3", title:"Session 5 — Agent Manager Prompt", type:"prompt",
+        desc:"The orchestrator. Runs as its own separate process from the API.",
+        cmd:"TASK: Create ~/shakti/backend/core/agent_manager.py and ~/shakti/backend/agent_runner.py\n\nAgentManager class:\n1. startup_sequence():\n   - await state.model_ready (blocks until warmup done)\n   - Init 38 GEOINT (priority=1), 84 CYBER (priority=2), 125 SIGINT (priority=3)\n   - Start watchdog + orchestration cycle\n\n2. orchestration_cycle():\n   - Check state.shutdown_event each iteration\n   - asyncio.wait_for(agent.safe_analyze(), timeout=25.0) per agent\n   - Stagger by 0.3s with asyncio.create_task()\n   - Push results to db_writer.enqueue() AND redis publish\n\n3. watchdog():\n   - asyncio.sleep(0) every 5s\n   - If loop response > 2s: log WATCHDOG_ALERT\n\n4. heartbeat_broadcaster():\n   - Every 15s: Redis publish {\"type\":\"ping\",\"ts\":timestamp}\n\n5. graceful_shutdown():\n   - Set shutdown_event → wait in-flight max 10s\n   - db_writer.stop() → Redis publish {\"type\":\"shutdown\"}\n\nagent_runner.py entry point:\n  if __name__ == \"__main__\":\n      asyncio.run(AgentManager().startup_sequence())\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.core.agent_manager import AgentManager; print(\"✅ agent_manager OK\")'" },
+      { id:"9.4", title:"Session 6 — GEOINT Cluster Prompt", type:"prompt",
+        desc:"38 satellite analysis agents with rolling baseline and sector validation.",
+        cmd:"TASK: Create ~/shakti/backend/agents/geoint/geoint_agent.py and sector_registry.py\n\nsector_registry.py:\nVALID_SECTORS = {\n  \"LAC_NORTH\":      Bbox(33.0,36.0, 77.0,80.0),\n  \"LAC_SOUTH\":      Bbox(30.0,33.0, 76.0,79.0),\n  \"GWADAR_PORT\":    Bbox(24.5,26.0, 61.0,63.0),\n  \"AKSAI_CHIN\":     Bbox(34.5,36.5, 78.0,82.0),\n  \"DOKLAM_PLATEAU\": Bbox(27.0,27.5, 88.8,89.5),\n  \"ANDAMAN_SEA\":    Bbox( 6.0,14.0, 91.0,98.0),\n}\nvalidate_stac_item() raises SectorValidationError if coords outside bounds\n\ngeoint_agent.py — GEOINTAgent (priority=1):\n- STAC item: cloud_cover random, ndbi from ChromaDB, gaussian noise std=0.08\n- Rolling baseline (Gap #7): new = 0.9*old + 0.1*current\n- Velocity alert: delta > 0.03 single cycle → ANOMALY_VELOCITY flag\n- cloud > 80% → INFO skip LLM\n- delta > 0.15 → call smart_generate()\n- 38 instances across 6 sectors\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.agents.geoint.geoint_agent import GEOINTAgent; print(\"✅ GEOINT OK\")'" },
+      { id:"9.5", title:"Session 7 — CYBER Cluster Prompt", type:"prompt",
+        desc:"84 agents: APT detection, MITRE correlation, chain analysis, audit trail.",
+        cmd:"TASK: Create ~/shakti/backend/agents/cyber/ with 3 files:\n\nchain_analyzer.py — ChainAnalyzer:\n- check_for_chains(event, db_path):\n  Query SQLite same src_ip last 4 hours\n  3+ distinct MITRE techniques → INSERT event_chains CAMPAIGN_DETECTED\n  Use UUIDv7 for chain_id\n\ncyber_agent.py — CyberAgent (priority=2):\n- Input validation (Gap #16):\n  src_ip must match IPv4 regex\n  packet_length in 20-65535\n  protocol in {TCP,UDP,ICMP,HTTP,HTTPS}\n- MITRE ATT&CK lookup via MitreAttackData singleton\n- Call ChainAnalyzer after each detection\n- 30 ICS/SCADA monitors, 30 network anomaly, 24 APT attribution\n\nprahaar_engine.py:\n- Every HIGH/CRITICAL → write policy_decisions table (Gap #11)\n- operator_reviewed=0, include data_snapshot JSON\n- Table is append-only (API reads, never deletes)\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.agents.cyber.cyber_agent import CyberAgent; print(\"✅ CYBER OK\")'" },
+      { id:"9.6", title:"Session 8 — SIGINT Cluster Prompt", type:"prompt",
+        desc:"125 multi-lingual agents with injection shielding and paraphrase rotation.",
+        cmd:"TASK: Create ~/shakti/backend/agents/sigint/ with:\n\nparaphrase_engine.py:\n- generate_paraphrase_pool(client, size=500)\n- Base scenarios: phishing_campaign, c2_infrastructure, false_positive\n- Generate 5 paraphrases per scenario using phi3:mini (one-time startup cost)\n- false_positive trains model NOT to over-flag\n\nsigint_agent.py — SIGINTAgent (priority=3):\n- ALL prompts through sanitize_prompt() first (Gap #13)\n- Use phi3:mini + sigint_semaphore (NOT main llm_semaphore)\n- Language clusters:\n  25 Mandarin, 30 Urdu/Hindi, 25 Arabic/Pashto,\n  30 English darkweb, 15 Multi-language\n- Rotate paraphrase_pool each cycle (Gap #18)\n- Defang extracted IPs: 1.2.3.4 → 1[.]2[.]3[.]4\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.agents.sigint.sigint_agent import SIGINTAgent; print(\"✅ SIGINT OK\")'" },
+    ]
+  },
+  {
+    id:"P10", title:"SESSION 9 — FASTAPI SERVER", subtitle:"Auth, TLS, validated endpoints, WebSocket with heartbeat.", color:C.cyan, icon:"🌐",
+    steps:[
+      { id:"10.1", title:"Session 9 — FastAPI Prompt", type:"prompt",
+        desc:"The central API. Separate process from agents.",
+        cmd:"TASK: Create ~/shakti/backend/main.py\n\nAuth dependency (Gap #6):\n  verify_token(authorization: str = Header()) → bool\n  Extract 'Bearer <token>' → security_manager.verify_token()\n  HTTPException(401) if invalid\n  Apply to ALL endpoints except /health and /hud\n\nEndpoints (ALL SQL must use parameterized ? not f-strings):\n  GET /health          {status, free_memory_gb, scheduler_mode, model_digest}\n  GET /events          limit: Field(ge=1,le=200), cluster, threat_level\n  GET /reports         latest 20 fusion reports\n  GET /reports/{id}    single report markdown\n  GET /shift-summary   LLM 8-hour summary (Gap #21)\n  POST /events/{id}/review  mark reviewed_at + reviewed_by\n  GET /policy-decisions     append-only audit (Gap #11)\n  WS  /ws?token=<t>    verify BEFORE ws.accept(); handle pong\n  GET /hud             serve ~/shakti/frontend/index.html\n\nRedis subscriber (background asyncio task):\n  Subscribe to 'shakti:live'\n  {type:pong} → ws_manager.record_pong()\n  All others → ws_manager.broadcast()\n\nSIGTERM/SIGINT (Gap #5):\n  Set shutdown_event → broadcast shutdown → wal_checkpoint → exit\n\nRun with TLS:\n  --ssl-keyfile ~/shakti/config/tls/server.key\n  --ssl-certfile ~/shakti/config/tls/server.crt\n  --port 8000\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.main import app; print(\"✅ main.py OK\")'" },
+      { id:"10.2", title:"First API Test", type:"cmd",
+        desc:"Start the server and confirm it responds to health check.",
+        cmd:"cd ~/shakti && source venv/bin/activate\n\n# Start server in background\npython3.11 -m uvicorn backend.main:app \\\n  --ssl-keyfile config/tls/server.key \\\n  --ssl-certfile config/tls/server.crt \\\n  --port 8000 --host 0.0.0.0 &\n\nsleep 4\n\n# Test health (no auth required)\ncurl -sk https://localhost:8000/health | jq .\n\n# Test authenticated endpoint\nTOKEN=$(cat ~/shakti/.session_token)\ncurl -sk -H \"Authorization: Bearer $TOKEN\" \\\n  'https://localhost:8000/events?limit=5' | jq .",
+        warn:"Browser will show 'certificate warning' — click Advanced → Proceed. This is expected for self-signed cert.",
+        verify:"✅  /health returns {\"status\": \"online\", ...}\n✅  /events returns {\"items\": [], ...} (empty is fine at this stage)\n✅  No 401 errors if token is correct" },
+    ]
+  },
+  {
+    id:"P11", title:"SESSIONS 10–11 — FUSION & HUD WIRING", subtitle:"Network Sentinel + wire your SHAKTI_Platform.html to live backend.", color:C.gold, icon:"🎯",
+    steps:[
+      { id:"11.1", title:"Create Network Sentinel (Sovereignty)", type:"cmd",
+        desc:"Blocks ALL non-localhost connections at runtime. Core sovereignty enforcement.",
+        cmd:"cat > ~/shakti/backend/core/network_sentinel.py << 'PYEOF'\nimport socket\nfrom loguru import logger\n\n_original_connect = socket.socket.connect\nALLOWED_HOSTS = {\"localhost\", \"127.0.0.1\", \"::1\", \"0.0.0.0\"}\n\ndef _patched_connect(self, address):\n    if isinstance(address, tuple):\n        host = address[0]\n        if host not in ALLOWED_HOSTS:\n            logger.bind(security_event=\"SOVEREIGNTY_VIOLATION\",\n                destination_host=host).critical(f\"BLOCKED: {host}\")\n            raise ConnectionRefusedError(f\"NetworkSentinel blocked: {host}\")\n    return _original_connect(self, address)\n\ndef activate_network_sentinel():\n    socket.socket.connect = _patched_connect\n    logger.info(\"Network Sentinel ACTIVE\")\nPYEOF\npython3.11 -c \"\nfrom backend.core.network_sentinel import activate_network_sentinel\nactivate_network_sentinel()\nimport socket\ntry:\n    s = socket.socket(); s.connect(('google.com', 443))\n    print('❌ FAILED: not blocked')\nexcept ConnectionRefusedError as e:\n    print('✅ Sentinel working:', e)\n\"",
+        verify:"✅  Should print: Sentinel working: NetworkSentinel blocked: google.com" },
+      { id:"11.2", title:"Session 10 — Fusion Crew Prompt", type:"prompt",
+        desc:"CrewAI synthesis triggered when HIGH events appear in 2+ clusters.",
+        cmd:"TASK: Create ~/shakti/backend/agents/fusion/fusion_crew.py\n\nFusion Crew (triggered when HIGH events in 2+ clusters in last 10 min):\n\nCollectionAgent: query SQLite last 10 min all clusters\nCorrelationAgent: find temporal (<30min) + spatial (same sector) overlap  \nStrategyAgent: apply PRAHAAR rules → write policy_decisions (Gap #11)\nReportingAgent: generate Markdown → save to reports table (Gap #10)\n\nAll agents:\n  ChatOpenAI(base_url='http://localhost:11434/v1', api_key='ollama')\n  model='llama3.2:1b', max_tokens=512, max_iter=3\n\nSHOW TASK LIST FIRST.",
+        verify:"python3.11 -c 'from backend.agents.fusion.fusion_crew import FusionCrew; print(\"✅ fusion OK\")'" },
+      { id:"11.3", title:"Copy & Wire SHAKTI_Platform.html", type:"action",
+        desc:"Copy your HTML to the serve location and add the 4 connection bridge blocks.",
+        warn:"Also replace the 4 cloud model names: Opus 4.6, Sonnet 4.6, Gemini 3 Flash, DeepSeek V3.2 → with: llama3.2:1b, phi3:mini, Rule-Based, CrewAI",
+        verify:"Step 1 — Copy HTML:\ncp ~/Downloads/SHAKTI_Platform.html ~/shakti/frontend/index.html\n\nStep 2 — Open in editor, find <script> near line 1560\nAdd these 4 blocks ABOVE the existing code:\n\n─── BLOCK 1: Auth ───────────────────────\nlet SESSION_TOKEN = null;\nasync function initAuth() {\n  const t = prompt('SHAKTI Auth\\nPaste token from: cat ~/shakti/.session_token');\n  if (!t) return;\n  SESSION_TOKEN = t.trim();\n  const ok = await fetch('https://localhost:8000/health',\n    {headers:{Authorization:'Bearer '+SESSION_TOKEN}}).then(r=>r.ok).catch(()=>false);\n  if (!ok) { alert('Token rejected'); return; }\n  initWS(); loadEvents();\n}\nwindow.addEventListener('load', initAuth);\n\n─── BLOCK 2: WebSocket ──────────────────\nlet ws, lastPong = Date.now();\nfunction initWS() {\n  ws = new WebSocket('wss://localhost:8000/ws?token='+SESSION_TOKEN);\n  ws.onmessage = e => {\n    const d = JSON.parse(e.data);\n    if (d.type==='ping') { ws.send(JSON.stringify({type:'pong'})); lastPong=Date.now(); return; }\n    if (d.type==='shutdown') { alert('SHAKTI OFFLINE'); return; }\n    addEvent(d);\n  };\n  setInterval(()=>{\n    const dot = document.querySelector('.status-dot');\n    if(dot) dot.style.background = (Date.now()-lastPong<20000)?'var(--accent-green)':'var(--critical)';\n  }, 5000);\n}\n\n─── BLOCK 3: Live Events ────────────────\nconst BUF=[], MAX=100;\nfunction addEvent(e) {\n  const feed = document.querySelector('.signal-item')?.parentElement;\n  if(!feed) return;\n  if(BUF.length>=MAX){BUF.shift();if(feed.firstChild)feed.removeChild(feed.firstChild);}\n  const c={CRITICAL:'var(--critical)',HIGH:'var(--accent-secondary)',MEDIUM:'var(--accent-gold)',LOW:'var(--accent-green)'};\n  const t=new Date(),ts=t.getHours().toString().padStart(2,'0')+':'+t.getMinutes().toString().padStart(2,'0')+' IST';\n  const el=document.createElement('div'); el.className='signal-item';\n  el.innerHTML=`<div class=\"signal-time\">${ts}</div><div class=\"signal-dot\" style=\"background:${c[e.threat_level]||'gray'}\"></div><div class=\"signal-text\"><strong>[${e.cluster}-${e.threat_level}]</strong> ${e.title}</div>`;\n  BUF.push(e); feed.insertBefore(el,feed.firstChild);\n  if(e.threat_level==='CRITICAL'){document.body.style.boxShadow='inset 0 0 60px rgba(255,34,68,0.4)';setTimeout(()=>document.body.style.boxShadow='',3000);}\n}\n\n─── BLOCK 4: Load Initial Events ────────\nasync function loadEvents() {\n  const h = {Authorization:'Bearer '+SESSION_TOKEN};\n  const data = await fetch('https://localhost:8000/events?limit=20',{headers:h})\n    .then(r=>r.json()).catch(()=>({items:[]}));\n  (data.items||[]).forEach(addEvent);\n}" },
+    ]
+  },
+  {
+    id:"P12", title:"MAKEFILE & LIVE LAUNCH", subtitle:"Production launch with readiness probes. First live boot.", color:C.green, icon:"🚀",
+    steps:[
+      { id:"12.1", title:"Create wait_for.sh (Gap #24 fix)", type:"cmd",
+        desc:"Replaces all 'sleep 3' guesses with real service readiness checks.",
+        cmd:"cat > ~/shakti/scripts/wait_for.sh << 'EOF'\n#!/bin/zsh\nURL=$1; SERVICE=$2; MAX=${3:-30}; COUNT=0\necho \"Waiting for $SERVICE...\"\nwhile [ $COUNT -lt $MAX ]; do\n  if curl -sk --max-time 2 \"$URL\" > /dev/null 2>&1; then\n    echo \"✅ $SERVICE ready (attempt $((COUNT+1)))\"; exit 0\n  fi\n  COUNT=$((COUNT+1))\n  echo \"  Attempt $COUNT/$MAX — retrying in 2s...\"\n  sleep 2\ndone\necho \"❌ $SERVICE did not start in $((MAX*2))s\"; exit 1\nEOF\nchmod +x ~/shakti/scripts/wait_for.sh\necho '✅ wait_for.sh ready'",
+        verify:"✅  ls -la ~/shakti/scripts/wait_for.sh\nShould show executable permissions (-rwxr-xr-x)" },
+      { id:"12.2", title:"Create the Makefile", type:"cmd",
+        desc:"One-command launch with correct startup ordering.",
+        cmd:"cat > ~/shakti/Makefile << 'EOF'\n.PHONY: start stop status test check-deps gen-certs\nSHAKTI_ROOT := $(HOME)/shakti\nVENV        := $(SHAKTI_ROOT)/venv/bin\nTOKEN       := $(shell cat $(SHAKTI_ROOT)/.session_token 2>/dev/null)\n\nstart: check-deps\n\t@echo \"━━━ SHAKTI V3 STARTUP ━━━\"\n\t@redis-server $(SHAKTI_ROOT)/config/redis.conf --daemonize yes\n\t@$(SHAKTI_ROOT)/scripts/wait_for.sh http://localhost:6379 Redis 15 || redis-cli ping\n\t@open /Applications/Ollama.app 2>/dev/null || true\n\t@$(SHAKTI_ROOT)/scripts/wait_for.sh http://localhost:11434/api/tags Ollama 30\n\t@curl -sf http://localhost:11434/api/generate -d '{\"model\":\"llama3.2:1b\",\"prompt\":\"reply: OK\",\"stream\":false}' --max-time 60 > /dev/null && echo \"  Model warm ✅\"\n\t@$(VENV)/python3.11 -m backend.agent_runner &\n\t@sleep 3\n\t@$(VENV)/uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 1 --loop uvloop --ssl-keyfile $(SHAKTI_ROOT)/config/tls/server.key --ssl-certfile $(SHAKTI_ROOT)/config/tls/server.crt &\n\t@$(SHAKTI_ROOT)/scripts/wait_for.sh https://localhost:8000/health API 30\n\t@echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━\"\n\t@echo \"SHAKTI V3 ONLINE ✅\"\n\t@echo \"Token: $(TOKEN)\"\n\t@echo \"HUD:   https://localhost:8000/hud\"\n\t@echo \"━━━━━━━━━━━━━━━━━━━━━━━━━━━\"\n\t@open https://localhost:8000/hud 2>/dev/null || true\n\nstop:\n\t@-pkill -TERM -f \"backend.main\" 2>/dev/null; sleep 3\n\t@-pkill -TERM -f \"backend.agent_runner\" 2>/dev/null; sleep 2\n\t@-sqlite3 $(SHAKTI_ROOT)/data/sqlite/shakti.db \"PRAGMA wal_checkpoint(TRUNCATE)\" 2>/dev/null\n\t@-redis-cli shutdown nosave 2>/dev/null\n\t@echo \"SHAKTI V3 OFFLINE\"\n\nstatus:\n\t@printf \"Memory: \"; vm_stat | awk '/Pages free/{printf \"%d MB free\\n\", int($$3)*4096/1048576}'\n\t@printf \"Redis:  \"; redis-cli ping 2>/dev/null || echo OFFLINE\n\t@printf \"Ollama: \"; curl -sf localhost:11434/api/ps | jq -r '.models[].name' 2>/dev/null | head -2 || echo OFFLINE\n\t@printf \"API:    \"; curl -skf https://localhost:8000/health | jq -r .status 2>/dev/null || echo OFFLINE\n\ntest:\n\t$(VENV)/pytest tests/ -v --asyncio-mode=auto -x\n\ncheck-deps:\n\t@command -v redis-server > /dev/null || (echo \"ERROR: brew install redis\" && exit 1)\n\t@ls /Applications/Ollama.app > /dev/null 2>&1 || (echo \"ERROR: Ollama not in /Applications\" && exit 1)\n\t@ls $(SHAKTI_ROOT)/config/tls/server.key > /dev/null 2>&1 || (echo \"ERROR: run make gen-certs\" && exit 1)\n\t@ls $(SHAKTI_ROOT)/.session_token > /dev/null 2>&1 || (echo \"ERROR: run Phase 4 step 4.4\" && exit 1)\n\ngen-certs:\n\tmkdir -p $(SHAKTI_ROOT)/config/tls\n\topenssl req -x509 -newkey rsa:4096 -nodes -days 365 -keyout $(SHAKTI_ROOT)/config/tls/server.key -out $(SHAKTI_ROOT)/config/tls/server.crt -subj \"/C=IN/ST=Delhi/O=SHAKTI/CN=localhost\"\n\tchmod 600 $(SHAKTI_ROOT)/config/tls/server.key\n\t@echo \"✅ TLS certs generated\"\nEOF\necho '✅ Makefile created'\nmake check-deps",
+        verify:"✅  make check-deps passes all checks or tells you exactly what's missing" },
+      { id:"12.3", title:"Final Import Verification", type:"cmd",
+        desc:"Confirm every module loads before launch.",
+        cmd:"cd ~/shakti && source venv/bin/activate\npython3.11 -c \"from backend.core.config import settings; print('✅ config')\"\npython3.11 -c \"from backend.core.security import security_manager; print('✅ security')\"\npython3.11 -c \"from backend.core.ollama_client import ollama_client; print('✅ ollama_client')\"\npython3.11 -c \"from backend.db.database import db_writer; print('✅ database')\"\npython3.11 -c \"from backend.agents.base_agent import BaseAgent; print('✅ base_agent')\"\npython3.11 -c \"from backend.agents.geoint.geoint_agent import GEOINTAgent; print('✅ geoint')\"\npython3.11 -c \"from backend.agents.cyber.cyber_agent import CyberAgent; print('✅ cyber')\"\npython3.11 -c \"from backend.agents.sigint.sigint_agent import SIGINTAgent; print('✅ sigint')\"\npython3.11 -c \"from backend.main import app; print('✅ main')\"\necho \"═══════════════════════════\"\necho \"ALL MODULES VERIFIED ✅\"",
+        verify:"✅  Every line prints without error\n❌  Any import error → go back to that session and fix the file" },
+      { id:"12.4", title:"🚀 LAUNCH — make start", type:"cmd",
+        desc:"First live boot. All 250 agents begin producing intelligence.",
+        cmd:"cd ~/shakti\nmake start",
+        warn:"First boot takes 60–90 seconds. The model warm step alone takes 30-60s. Be patient.",
+        verify:"Watch for each step:\n✅ Redis ready\n✅ Ollama ready\n✅ Model warm\n✅ API ready\n\nThen: SHAKTI V3 ONLINE ✅\nBrowser opens to https://localhost:8000/hud\n\nIn browser:\n1. Click 'Advanced' → 'Proceed to localhost' (cert warning is expected)\n2. Paste your session token when prompted\n3. HUD loads with LIVE data in the signal ticker!" },
+      { id:"12.5", title:"Verify Intelligence is Flowing", type:"cmd",
+        desc:"Confirm agents produce events and WebSocket streams them.",
+        cmd:"TOKEN=$(cat ~/shakti/.session_token)\n\n# Check events exist\ncurl -sk -H \"Authorization: Bearer $TOKEN\" \\\n  'https://localhost:8000/events?limit=5' | jq '.items[] | {cluster,threat_level,title}'\n\n# Check platform health\ncurl -sk -H \"Authorization: Bearer $TOKEN\" \\\n  'https://localhost:8000/health' | jq .\n\n# Watch live log\ntail -f ~/shakti/logs/shakti_*.log | jq '{level:.record.level.name, msg:.record.message}' 2>/dev/null",
+        verify:"✅  Events show cluster, threat_level, title populated\n✅  Health shows scheduler_mode: SUSTAINED, free_memory_gb > 2.0\n✅  Logs show agent activity every 30 seconds" },
+    ]
+  },
+];
+
+const TOTAL = PHASES.reduce((s,p) => s + p.steps.length, 0);
+
+const TYPE_COLOR = { cmd:C.cyan, code:C.green, action:C.gold, prompt:C.purple };
+const TYPE_LABEL = { cmd:"TERMINAL", code:"CODE FILE", action:"MANUAL ACTION", prompt:"IDE PROMPT" };
+
+export default function App() {
+  const [done, setDone] = useState({});
+  const [phase, setPhase] = useState(0);
+  const [open, setOpen] = useState(null);
+  const [copied, setCopied] = useState(null);
+  const top = useRef(null);
+
+  // Load progress from storage safely
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await window.storage.get("sp");
+        if (r && r.value) setDone(JSON.parse(r.value));
+      } catch (_) {}
+    };
+    load();
+  }, []);
+
+  const markDone = (id) => {
+    const next = { ...done, [id]: !done[id] };
+    setDone(next);
+    try { window.storage.set("sp", JSON.stringify(next)); } catch (_) {}
+  };
+
+  const copyIt = (text, id) => {
+    try { navigator.clipboard.writeText(text); } catch (_) {}
+    setCopied(id); setTimeout(() => setCopied(null), 2000);
+  };
+
+  const doneCount = Object.values(done).filter(Boolean).length;
+  const phasePct = (p) => {
+    const d = p.steps.filter(s => done[s.id]).length;
+    return { d, t: p.steps.length, pct: Math.round(d / p.steps.length * 100) };
+  };
+
+  const cur = PHASES[phase];
+
+  return (
+    <div style={{ display:"flex", height:"100vh", background:C.bg, color:C.textPrimary,
+      fontFamily:"'Courier New',monospace", fontSize:12, overflow:"hidden" }}>
+
+      {/* SIDEBAR */}
+      <div style={{ width:220, background:C.panel, borderRight:`1px solid ${C.border}`,
+        display:"flex", flexDirection:"column", flexShrink:0 }}>
+
+        {/* Logo + master progress */}
+        <div style={{ padding:"14px 12px 10px", borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ fontSize:15, color:C.cyan, letterSpacing:3, fontWeight:"bold" }}>▓ SHAKTI V3</div>
+          <div style={{ fontSize:8, color:C.textDim, letterSpacing:2, marginTop:2 }}>IMPLEMENTATION GUIDE</div>
+          <div style={{ marginTop:10 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:8, color:C.textDim, marginBottom:3 }}>
+              <span>MISSION PROGRESS</span>
+              <span style={{ color:C.cyan }}>{doneCount}/{TOTAL}</span>
+            </div>
+            <div style={{ height:3, background:C.border, borderRadius:2 }}>
+              <div style={{ height:"100%", width:`${Math.round(doneCount/TOTAL*100)}%`,
+                background:C.cyan, borderRadius:2, transition:"width 0.3s" }} />
+            </div>
+            <div style={{ textAlign:"right", fontSize:8, color:C.cyan, marginTop:2 }}>
+              {Math.round(doneCount/TOTAL*100)}%
+            </div>
+          </div>
+        </div>
+
+        {/* Phase list */}
+        <div style={{ flex:1, overflowY:"auto" }}>
+          {PHASES.map((p, i) => {
+            const { d, t, pct } = phasePct(p);
+            const active = phase === i;
+            return (
+              <div key={p.id} onClick={() => { setPhase(i); top.current?.scrollTo(0,0); setOpen(null); }}
+                style={{ padding:"9px 12px", cursor:"pointer",
+                  borderLeft:`3px solid ${active ? p.color : "transparent"}`,
+                  background: active ? `${p.color}12` : "transparent" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                  <span style={{ fontSize:13 }}>{p.icon}</span>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontSize:9, color: active ? p.color : C.textSec,
+                      fontWeight: active ? "bold" : "normal", letterSpacing:0.5 }}>{p.id}</div>
+                    <div style={{ fontSize:8, color:C.textDim }}>{d}/{t} done</div>
+                  </div>
+                  {d===t && <span style={{ color:C.green, fontSize:10 }}>✓</span>}
+                </div>
+                <div style={{ height:2, background:C.border, borderRadius:1, marginTop:5 }}>
+                  <div style={{ height:"100%", width:`${pct}%`, background:p.color,
+                    borderRadius:1, opacity:0.6 }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* MAIN */}
+      <div ref={top} style={{ flex:1, overflowY:"auto", padding:"20px 24px 60px" }}>
+
+        {/* Phase header */}
+        <div style={{ marginBottom:20 }}>
+          <div style={{ fontSize:8, color:C.textDim, letterSpacing:3, marginBottom:3 }}>
+            PHASE {phase+1} OF {PHASES.length}
+          </div>
+          <div style={{ fontSize:20, color:cur.color, letterSpacing:2, marginBottom:5 }}>
+            {cur.icon} {cur.title}
+          </div>
+          <div style={{ fontSize:11, color:C.textSec, marginBottom:14, lineHeight:1.6, maxWidth:640 }}>
+            {cur.subtitle}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={() => { setPhase(Math.max(0,phase-1)); top.current?.scrollTo(0,0); }}
+              disabled={phase===0}
+              style={{ padding:"5px 14px", background:"transparent",
+                border:`1px solid ${phase===0?C.border:C.borderBright}`,
+                color:phase===0?C.textDim:C.textSec, cursor:phase===0?"not-allowed":"pointer",
+                fontSize:9, fontFamily:"inherit", borderRadius:2, letterSpacing:1 }}>
+              ← PREV
+            </button>
+            <button onClick={() => { setPhase(Math.min(PHASES.length-1,phase+1)); top.current?.scrollTo(0,0); }}
+              disabled={phase===PHASES.length-1}
+              style={{ padding:"5px 14px", background:`${cur.color}15`,
+                border:`1px solid ${cur.color}70`,
+                color:cur.color, cursor:phase===PHASES.length-1?"not-allowed":"pointer",
+                fontSize:9, fontFamily:"inherit", borderRadius:2, letterSpacing:1 }}>
+              NEXT →
+            </button>
+          </div>
+        </div>
+
+        {/* Steps */}
+        {cur.steps.map((step, si) => {
+          const isDone = !!done[step.id];
+          const isOpen = open === step.id;
+          const tc = TYPE_COLOR[step.type] || C.textSec;
+          return (
+            <div key={step.id} style={{ marginBottom:8,
+              border:`1px solid ${isDone?"#00ff8840":isOpen?C.borderBright:C.border}`,
+              borderRadius:4, background:isDone?"rgba(0,255,136,0.03)":isOpen?C.card:C.panel }}>
+
+              {/* Header row */}
+              <div onClick={() => setOpen(isOpen ? null : step.id)}
+                style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 14px", cursor:"pointer" }}>
+
+                {/* Checkbox */}
+                <div onClick={e => { e.stopPropagation(); markDone(step.id); }}
+                  style={{ width:18, height:18, borderRadius:"50%", flexShrink:0,
+                    border:`2px solid ${isDone?C.green:C.borderBright}`,
+                    background:isDone?"rgba(0,255,136,0.2)":"transparent",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    cursor:"pointer", fontSize:9, color:C.green }}>
+                  {isDone ? "✓" : ""}
+                </div>
+
+                <span style={{ fontSize:8, padding:"1px 5px", borderRadius:2,
+                  border:`1px solid ${tc}50`, color:tc, flexShrink:0 }}>
+                  {TYPE_LABEL[step.type]}
+                </span>
+                <span style={{ fontSize:8, color:C.textDim, flexShrink:0 }}>{step.id}</span>
+                <span style={{ flex:1, fontSize:11, color:isDone?C.textPrimary:C.textSec,
+                  fontWeight:isDone?"bold":"normal" }}>
+                  {step.title}
+                </span>
+                <span style={{ color:C.textDim, fontSize:11 }}>{isOpen?"▲":"▼"}</span>
+              </div>
+
+              {/* Expanded */}
+              {isOpen && (
+                <div style={{ padding:"0 14px 14px", borderTop:`1px solid ${C.border}` }}>
+                  <div style={{ marginTop:10, fontSize:11, color:C.textSec, lineHeight:1.7 }}>
+                    {step.desc}
+                  </div>
+
+                  {step.warn && (
+                    <div style={{ marginTop:8, padding:"7px 10px",
+                      background:"rgba(255,107,53,0.08)", borderLeft:`3px solid ${C.orange}`,
+                      border:`1px solid rgba(255,107,53,0.25)`, borderRadius:3,
+                      fontSize:10, color:C.orange, lineHeight:1.6 }}>
+                      ⚠ {step.warn}
+                    </div>
+                  )}
+
+                  {step.cmd && (
+                    <div style={{ marginTop:10 }}>
+                      <div style={{ display:"flex", justifyContent:"space-between",
+                        alignItems:"center", marginBottom:5 }}>
+                        <span style={{ fontSize:8, color:tc, letterSpacing:2 }}>
+                          {step.type==="prompt" ? "COPY → PASTE INTO ANTIGRAVITY IDE" :
+                           step.type==="cmd" ? "RUN IN TERMINAL (copy whole block)" :
+                           "CREATE THIS FILE"}
+                        </span>
+                        <button onClick={() => copyIt(step.cmd, step.id)}
+                          style={{ padding:"3px 10px", fontSize:8, fontFamily:"inherit",
+                            background: copied===step.id ? "rgba(0,255,136,0.15)" : `${tc}10`,
+                            border:`1px solid ${copied===step.id?C.green:tc}60`,
+                            color: copied===step.id ? C.green : tc,
+                            cursor:"pointer", borderRadius:2, letterSpacing:1 }}>
+                          {copied===step.id ? "✓ COPIED" : "COPY"}
+                        </button>
+                      </div>
+                      <pre style={{ margin:0, padding:12, fontSize:10, lineHeight:1.7,
+                        background: step.type==="prompt" ? "#080d18" : "#050e1a",
+                        border:`1px solid ${tc}25`, borderRadius:3,
+                        color: step.type==="prompt" ? "#c4a8ff" : "#8ecf8e",
+                        whiteSpace:"pre-wrap", wordBreak:"break-word",
+                        maxHeight:360, overflowY:"auto" }}>
+                        {step.cmd}
+                      </pre>
+                    </div>
+                  )}
+
+                  {step.verify && (
+                    <div style={{ marginTop:8, padding:"8px 10px",
+                      background:`${tc}06`, borderLeft:`3px solid ${tc}`,
+                      border:`1px solid ${tc}20`, borderRadius:3 }}>
+                      <div style={{ fontSize:8, color:tc, letterSpacing:2, marginBottom:4 }}>
+                        {step.type==="action" ? "HOW TO DO IT" : "EXPECTED OUTPUT / HOW TO VERIFY"}
+                      </div>
+                      <pre style={{ margin:0, fontSize:10, color:C.textSec,
+                        whiteSpace:"pre-wrap", lineHeight:1.6 }}>
+                        {step.verify}
+                      </pre>
+                    </div>
+                  )}
+
+                  <div style={{ marginTop:12, display:"flex", gap:8 }}>
+                    <button onClick={() => markDone(step.id)}
+                      style={{ padding:"6px 16px", fontSize:9, fontFamily:"inherit",
+                        background: isDone ? "rgba(0,255,136,0.12)" : `${cur.color}15`,
+                        border:`1px solid ${isDone?C.green:cur.color}`,
+                        color:isDone?C.green:cur.color, cursor:"pointer", borderRadius:2, letterSpacing:1 }}>
+                      {isDone ? "✓ MARK INCOMPLETE" : "✓ MARK COMPLETE"}
+                    </button>
+                    {si < cur.steps.length-1 && (
+                      <button onClick={() => setOpen(cur.steps[si+1].id)}
+                        style={{ padding:"6px 14px", fontSize:9, fontFamily:"inherit",
+                          background:"transparent", border:`1px solid ${C.border}`,
+                          color:C.textDim, cursor:"pointer", borderRadius:2 }}>
+                        NEXT STEP →
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Phase complete banner */}
+        {phasePct(cur).d === cur.steps.length && (
+          <div style={{ marginTop:14, padding:"12px 16px",
+            background:"rgba(0,255,136,0.05)", border:"1px solid rgba(0,255,136,0.25)",
+            borderRadius:4, display:"flex", alignItems:"center", gap:12 }}>
+            <span style={{ fontSize:18 }}>✅</span>
+            <div style={{ flex:1 }}>
+              <div style={{ color:C.green, fontSize:11, letterSpacing:1 }}>
+                {cur.title} — COMPLETE
+              </div>
+              {phase < PHASES.length-1 && (
+                <div style={{ color:C.textDim, fontSize:9, marginTop:2 }}>
+                  Next: {PHASES[phase+1].title}
+                </div>
+              )}
+            </div>
+            {phase < PHASES.length-1 && (
+              <button onClick={() => { setPhase(phase+1); top.current?.scrollTo(0,0); setOpen(null); }}
+                style={{ padding:"6px 16px", fontSize:9, fontFamily:"inherit",
+                  background:`${PHASES[phase+1].color}15`,
+                  border:`1px solid ${PHASES[phase+1].color}`,
+                  color:PHASES[phase+1].color, cursor:"pointer", borderRadius:2, letterSpacing:1 }}>
+                START {PHASES[phase+1].id} →
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
