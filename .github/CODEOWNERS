@@ -1,0 +1,5 @@
+# Default ownership for all repository files.
+* @yogendrasinghaiml
+
+# Extra explicit coverage for CI/security policy files.
+.github/workflows/* @yogendrasinghaiml
