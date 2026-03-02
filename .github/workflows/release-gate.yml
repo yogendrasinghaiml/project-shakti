@@ -48,7 +48,7 @@ jobs:
           grep -Eq '^[[:space:]]{2}release-gate:[[:space:]]*$' .github/workflows/release-gate.yml
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
