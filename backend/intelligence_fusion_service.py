@@ -26,12 +26,14 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 
 try:
     from asyncio_mqtt import Client as MQTTClient
-    from asyncio_mqtt import MqttError
+    from asyncio_mqtt import MqttError as AsyncIOMqttError
 except Exception:  # pragma: no cover - optional dependency during local scaffolding
     MQTTClient = None
 
-    class MqttError(Exception):
+    class AsyncIOMqttError(Exception):  # type: ignore[no-redef]
         pass
+
+MqttError = AsyncIOMqttError
 
 
 logger = logging.getLogger("shakti.intelligence_fusion")

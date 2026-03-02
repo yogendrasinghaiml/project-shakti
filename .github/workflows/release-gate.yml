@@ -105,6 +105,12 @@ jobs:
           print("Secret hygiene scan passed.")
           PY
 
+      - name: Backend lint
+        run: python -m ruff check backend
+
+      - name: Backend type check
+        run: python -m mypy --config-file backend/mypy.ini
+
       - name: Wait for PostgreSQL
         run: |
           for i in {1..40}; do
@@ -117,8 +123,8 @@ jobs:
       - name: Backend unit tests
         run: python -m pytest backend/tests/test_intelligence_fusion_service.py -q
 
-      - name: Backend full suite
-        run: python -m pytest backend/tests -q
+      - name: Backend full suite with coverage gate
+        run: python -m pytest backend/tests -q --cov=backend --cov-report=term-missing --cov-fail-under=70
 
       - name: Frontend tests
         run: npm run test:frontend
