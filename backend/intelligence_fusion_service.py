@@ -564,6 +564,44 @@ def load_shared_secrets_from_file(path: str) -> tuple[str, str]:
     return primary, secondary
 
 
+def load_text_value(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip()
+
+
+def load_text_value_from_env_or_file(name: str, default: str = "") -> str:
+    raw_value = os.getenv(name)
+    raw_file = os.getenv(f"{name}_FILE")
+    value = raw_value.strip() if raw_value is not None else ""
+    file_path = raw_file.strip() if raw_file is not None else ""
+
+    if value and file_path:
+        raise ValueError(f"{name} and {name}_FILE cannot both be set.")
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"{name}_FILE is unreadable: {file_path}") from exc
+    if raw_value is None:
+        return default
+    return value
+
+
+def load_bool_value(name: str, default: bool) -> bool:
+    default_raw = "true" if default else "false"
+    return load_text_value(name, default_raw).lower() in {"1", "true", "yes", "on"}
+
+
+def load_int_value(name: str, default: int) -> int:
+    return int(load_text_value(name, str(default)))
+
+
+def load_float_value(name: str, default: float) -> float:
+    return float(load_text_value(name, str(default)))
+
+
 class Coordinate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -607,73 +645,93 @@ class ConflictOut(BaseModel):
 
 @dataclass
 class Settings:
-    pg_dsn: str = os.getenv(
-        "PG_DSN",
-        "postgresql://shakti:shakti@127.0.0.1:5432/shakti",
+    pg_dsn: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file(
+            "PG_DSN",
+            "postgresql://shakti:shakti@127.0.0.1:5432/shakti",
+        )
     )
-    log_level: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-    log_json: bool = (
-        os.getenv("LOG_JSON", "true").strip().lower() in {"1", "true", "yes", "on"}
+    log_level: str = field(default_factory=lambda: load_text_value("LOG_LEVEL", "INFO").upper())
+    log_json: bool = field(default_factory=lambda: load_bool_value("LOG_JSON", True))
+    db_slow_query_threshold_ms: float = field(
+        default_factory=lambda: load_float_value("DB_SLOW_QUERY_THRESHOLD_MS", 250)
     )
-    db_slow_query_threshold_ms: float = float(
-        os.getenv("DB_SLOW_QUERY_THRESHOLD_MS", "250")
+    mqtt_enabled: bool = field(default_factory=lambda: load_bool_value("MQTT_ENABLED", True))
+    mqtt_host: str = field(default_factory=lambda: load_text_value("MQTT_HOST", "127.0.0.1"))
+    mqtt_port: int = field(default_factory=lambda: load_int_value("MQTT_PORT", 1883))
+    mqtt_topic: str = field(default_factory=lambda: load_text_value("MQTT_TOPIC", "shakti/intel/#"))
+    mqtt_username: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("MQTT_USERNAME", "")
     )
-    mqtt_enabled: bool = (
-        os.getenv("MQTT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_password: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("MQTT_PASSWORD", "")
     )
-    mqtt_host: str = os.getenv("MQTT_HOST", "127.0.0.1")
-    mqtt_port: int = int(os.getenv("MQTT_PORT", "1883"))
-    mqtt_topic: str = os.getenv("MQTT_TOPIC", "shakti/intel/#")
-    mqtt_username: str = os.getenv("MQTT_USERNAME", "")
-    mqtt_password: str = os.getenv("MQTT_PASSWORD", "")
-    mqtt_require_auth: bool = (
-        os.getenv("MQTT_REQUIRE_AUTH", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_require_auth: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_REQUIRE_AUTH", True)
     )
-    mqtt_tls_enabled: bool = (
-        os.getenv("MQTT_TLS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_tls_enabled: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_TLS_ENABLED", True)
     )
-    mqtt_require_tls: bool = (
-        os.getenv("MQTT_REQUIRE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_require_tls: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_REQUIRE_TLS", True)
     )
-    mqtt_tls_reload_check_seconds: int = int(
-        os.getenv("MQTT_TLS_RELOAD_CHECK_SECONDS", "15")
+    mqtt_tls_reload_check_seconds: int = field(
+        default_factory=lambda: load_int_value("MQTT_TLS_RELOAD_CHECK_SECONDS", 15)
     )
-    mqtt_tls_ca_file: str = os.getenv("MQTT_TLS_CA_FILE", "")
-    mqtt_tls_cert_file: str = os.getenv("MQTT_TLS_CERT_FILE", "")
-    mqtt_tls_key_file: str = os.getenv("MQTT_TLS_KEY_FILE", "")
-    conflict_threshold_m: float = float(os.getenv("CONFLICT_THRESHOLD_M", "250.0"))
-    max_ingest_bytes: int = int(os.getenv("MAX_INGEST_BYTES", "65536"))
-    api_rate_limit_enabled: bool = (
-        os.getenv("API_RATE_LIMIT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_tls_ca_file: str = field(default_factory=lambda: load_text_value("MQTT_TLS_CA_FILE", ""))
+    mqtt_tls_cert_file: str = field(
+        default_factory=lambda: load_text_value("MQTT_TLS_CERT_FILE", "")
     )
-    api_rate_limit_require_persistent: bool = (
-        os.getenv("API_RATE_LIMIT_REQUIRE_PERSISTENT", "true").strip().lower()
-        in {"1", "true", "yes", "on"}
+    mqtt_tls_key_file: str = field(default_factory=lambda: load_text_value("MQTT_TLS_KEY_FILE", ""))
+    conflict_threshold_m: float = field(
+        default_factory=lambda: load_float_value("CONFLICT_THRESHOLD_M", 250.0)
     )
-    api_rate_limit_requests: int = int(os.getenv("API_RATE_LIMIT_REQUESTS", "120"))
-    api_rate_limit_window_seconds: int = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
-    mqtt_service_user_id: str = os.getenv(
-        "MQTT_SERVICE_USER_ID", "00000000-0000-0000-0000-000000000000"
+    max_ingest_bytes: int = field(default_factory=lambda: load_int_value("MAX_INGEST_BYTES", 65536))
+    api_rate_limit_enabled: bool = field(
+        default_factory=lambda: load_bool_value("API_RATE_LIMIT_ENABLED", True)
     )
-    mqtt_service_clearance: ClearanceLevel = ClearanceLevel(
-        os.getenv("MQTT_SERVICE_CLEARANCE", "TOP_SECRET")
+    api_rate_limit_require_persistent: bool = field(
+        default_factory=lambda: load_bool_value("API_RATE_LIMIT_REQUIRE_PERSISTENT", True)
     )
-    auth_shared_secret_primary: str = os.getenv(
-        "AUTH_SHARED_SECRET_PRIMARY",
-        os.getenv("AUTH_SHARED_SECRET", ""),
+    api_rate_limit_requests: int = field(
+        default_factory=lambda: load_int_value("API_RATE_LIMIT_REQUESTS", 120)
     )
-    auth_shared_secret_secondary: str = os.getenv("AUTH_SHARED_SECRET_SECONDARY", "")
-    auth_shared_secrets_file: str = os.getenv("AUTH_SHARED_SECRETS_FILE", "")
-    auth_expected_audience: str = os.getenv(
-        "AUTH_EXPECTED_AUDIENCE",
-        AUTH_DEFAULT_AUDIENCE,
+    api_rate_limit_window_seconds: int = field(
+        default_factory=lambda: load_int_value("API_RATE_LIMIT_WINDOW_SECONDS", 60)
     )
-    auth_max_skew_seconds: int = int(os.getenv("AUTH_MAX_SKEW_SECONDS", "300"))
-    auth_replay_ttl_seconds: int = int(os.getenv("AUTH_REPLAY_TTL_SECONDS", "900"))
-    auth_max_claims_bytes: int = int(os.getenv("AUTH_MAX_CLAIMS_BYTES", "4096"))
-    auth_require_persistent_replay_guard: bool = (
-        os.getenv("AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD", "true").strip().lower()
-        in {"1", "true", "yes", "on"}
+    mqtt_service_user_id: str = field(
+        default_factory=lambda: load_text_value(
+            "MQTT_SERVICE_USER_ID",
+            "00000000-0000-0000-0000-000000000000",
+        )
+    )
+    mqtt_service_clearance: ClearanceLevel = field(
+        default_factory=lambda: ClearanceLevel(load_text_value("MQTT_SERVICE_CLEARANCE", "TOP_SECRET"))
+    )
+    auth_shared_secret_primary: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY", "")
+        or load_text_value_from_env_or_file("AUTH_SHARED_SECRET", "")
+    )
+    auth_shared_secret_secondary: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("AUTH_SHARED_SECRET_SECONDARY", "")
+    )
+    auth_shared_secrets_file: str = field(
+        default_factory=lambda: load_text_value("AUTH_SHARED_SECRETS_FILE", "")
+    )
+    auth_expected_audience: str = field(
+        default_factory=lambda: load_text_value("AUTH_EXPECTED_AUDIENCE", AUTH_DEFAULT_AUDIENCE)
+    )
+    auth_max_skew_seconds: int = field(
+        default_factory=lambda: load_int_value("AUTH_MAX_SKEW_SECONDS", 300)
+    )
+    auth_replay_ttl_seconds: int = field(
+        default_factory=lambda: load_int_value("AUTH_REPLAY_TTL_SECONDS", 900)
+    )
+    auth_max_claims_bytes: int = field(
+        default_factory=lambda: load_int_value("AUTH_MAX_CLAIMS_BYTES", 4096)
+    )
+    auth_require_persistent_replay_guard: bool = field(
+        default_factory=lambda: load_bool_value("AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD", True)
     )
     auth_active_shared_secrets: tuple[str, ...] = field(init=False, default=())
 

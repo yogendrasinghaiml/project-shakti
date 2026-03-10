@@ -64,10 +64,17 @@ Use the staging override plus the published GHCR image:
 
 ```bash
 cp ops/staging/staging.env.example .env.staging
+POSTGRES_PASSWORD=replace-with-a-real-password \
+AUTH_SHARED_SECRET_PRIMARY=replace-with-a-real-secret \
+./ops/staging/render-secrets.sh
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml up -d
 ```
 
-This adds Prometheus, Grafana, and PostgreSQL exporter around the API. The starter dashboard and scrape config live under `ops/staging/`.
+This adds Prometheus, Grafana, and PostgreSQL exporter around the API. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
+
+## Production Plan
+
+The current production hardening task list is tracked in `docs/production_readiness_plan.md`.
 
 ## Image Publishing
 

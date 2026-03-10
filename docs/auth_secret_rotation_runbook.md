@@ -6,6 +6,8 @@ This runbook defines how to rotate shared secrets used for signed gateway auth c
 
 - `AUTH_SHARED_SECRET_PRIMARY`
 - `AUTH_SHARED_SECRET_SECONDARY`
+- `AUTH_SHARED_SECRET_PRIMARY_FILE`
+- `AUTH_SHARED_SECRET_SECONDARY_FILE`
 - `AUTH_SHARED_SECRETS_FILE` (JSON source of `primary` and `secondary`)
 
 It also defines replay-guard requirements for production deployments.
@@ -80,4 +82,3 @@ Rules:
    - Replay detected
 2. Alert if replay-guard table growth exceeds expected TTL behavior.
 3. Periodically prune/monitor `auth_claim_replay_guard` index health.
-

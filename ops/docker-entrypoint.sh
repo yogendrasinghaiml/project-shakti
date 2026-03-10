@@ -11,17 +11,45 @@ from urllib.parse import urlsplit, urlunsplit
 import asyncpg
 
 
-PG_DSN = os.environ.get("PG_DSN", "postgresql://shakti:shakti@postgres:5432/shakti")
-WAIT_TIMEOUT_SECONDS = float(os.environ.get("SHAKTI_DB_WAIT_TIMEOUT_SECONDS", "60"))
-CONNECT_TIMEOUT_SECONDS = float(os.environ.get("SHAKTI_DB_CONNECT_TIMEOUT_SECONDS", "3"))
-APPLY_SCHEMA = os.environ.get("SHAKTI_APPLY_SCHEMA_ON_BOOT", "true").strip().lower() in {
+def load_text_value(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip()
+
+
+def load_text_value_from_env_or_file(name: str, default: str = "") -> str:
+    raw_value = os.environ.get(name)
+    raw_file = os.environ.get(f"{name}_FILE")
+    value = raw_value.strip() if raw_value is not None else ""
+    file_path = raw_file.strip() if raw_file is not None else ""
+
+    if value and file_path:
+        raise RuntimeError(f"{name} and {name}_FILE cannot both be set.")
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"{name}_FILE is unreadable: {file_path}") from exc
+    if raw_value is None:
+        return default
+    return value
+
+
+PG_DSN = load_text_value_from_env_or_file(
+    "PG_DSN",
+    "postgresql://shakti:shakti@postgres:5432/shakti",
+)
+WAIT_TIMEOUT_SECONDS = float(load_text_value("SHAKTI_DB_WAIT_TIMEOUT_SECONDS", "60"))
+CONNECT_TIMEOUT_SECONDS = float(load_text_value("SHAKTI_DB_CONNECT_TIMEOUT_SECONDS", "3"))
+APPLY_SCHEMA = load_text_value("SHAKTI_APPLY_SCHEMA_ON_BOOT", "true").lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
 SCHEMA_PATH = Path(
-    os.environ.get("SHAKTI_SCHEMA_PATH", "/app/db/phase2_schema_postgres_postgis.sql")
+    load_text_value("SHAKTI_SCHEMA_PATH", "/app/db/phase2_schema_postgres_postgis.sql")
 )
 
 

@@ -1,0 +1,49 @@
+# Production Readiness Plan
+
+This checklist tracks the remaining work to move SHAKTI from staging-grade to production-grade.
+
+## Phase 1: Secret Management And Rotation
+
+- [x] Add file-backed secret loading for the API runtime (`*_FILE` support for critical secrets)
+- [x] Move staging API auth and database DSN to mounted secret files
+- [x] Add a staging secret rendering utility and secret directory contract
+- [ ] Move database/exporter/Grafana credentials to secret-file wiring where supported
+- [ ] Add external secret manager examples for Kubernetes and cloud deployments
+
+## Phase 2: Database Migrations And Rollback
+
+- [ ] Introduce a versioned migration table and migration runner
+- [ ] Split the current schema bootstrap into ordered migration files
+- [ ] Make schema-on-boot dev-only and require explicit migrations in staging/prod
+- [ ] Add rollback and drift-check commands
+
+## Phase 3: Backup, Restore, DR, And Alerting
+
+- [ ] Add PostgreSQL backup and restore scripts
+- [ ] Add recovery-point and recovery-time objectives to runbooks
+- [ ] Add Prometheus alert rules for API failures, latency, and database health
+- [ ] Add a restore drill checklist
+
+## Phase 4: Load Testing And Capacity Limits
+
+- [ ] Add a load-testing harness for ingest and conflict retrieval flows
+- [ ] Define baseline SLO targets and max tested concurrency
+- [ ] Capture p95/p99 latency and error-rate thresholds in docs
+
+## Phase 5: Real Deployment Targets
+
+- [ ] Add Kubernetes manifests or a Helm chart
+- [ ] Add environment overlays for staging and production
+- [ ] Add image/tag pinning and rollout strategy docs
+
+## Phase 6: External Auth Hardening
+
+- [ ] Add JWT/JWKS validation for real external identity providers
+- [ ] Separate gateway signing concerns from service-side validation
+- [ ] Add key rotation and issuer/audience policy tests
+
+## Phase 7: Frontend Product Hardening
+
+- [ ] Add production navigation, error states, and loading states
+- [ ] Add frontend smoke tests for the main user paths
+- [ ] Replace demo-only surfaces with real API-backed flows

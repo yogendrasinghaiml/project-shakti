@@ -29,6 +29,7 @@ from backend.intelligence_fusion_service import (
     create_app,
     clearance_allows,
     haversine_distance_m,
+    load_text_value_from_env_or_file,
 )
 
 TEST_AUTH_SECRET = "test-shared-secret"
@@ -784,3 +785,51 @@ def test_settings_rejects_invalid_log_level():
 def test_settings_rejects_invalid_db_slow_query_threshold():
     with pytest.raises(ValueError, match="DB_SLOW_QUERY_THRESHOLD_MS must be a positive number"):
         Settings(db_slow_query_threshold_ms=0)
+
+
+def test_load_text_value_from_env_or_file_reads_secret_file(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("file-backed-secret\n", encoding="utf-8")
+    monkeypatch.delenv("AUTH_SHARED_SECRET_PRIMARY", raising=False)
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    assert (
+        load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY")
+        == "file-backed-secret"
+    )
+
+
+def test_load_text_value_from_env_or_file_rejects_conflicting_sources(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("file-backed-secret\n", encoding="utf-8")
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY", "env-secret")
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    with pytest.raises(
+        ValueError,
+        match="AUTH_SHARED_SECRET_PRIMARY and AUTH_SHARED_SECRET_PRIMARY_FILE cannot both be set",
+    ):
+        load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY")
+
+
+def test_settings_loads_primary_auth_secret_from_file(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("rotated-primary\n", encoding="utf-8")
+    monkeypatch.delenv("AUTH_SHARED_SECRET_PRIMARY", raising=False)
+    monkeypatch.delenv("AUTH_SHARED_SECRET", raising=False)
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    settings = Settings()
+
+    assert settings.auth_shared_secret_primary == "rotated-primary"
+
+
+def test_settings_loads_pg_dsn_from_file(tmp_path, monkeypatch):
+    dsn_path = tmp_path / "pg_dsn"
+    dsn_path.write_text("postgresql://shakti:file@db.internal:5432/shakti\n", encoding="utf-8")
+    monkeypatch.delenv("PG_DSN", raising=False)
+    monkeypatch.setenv("PG_DSN_FILE", str(dsn_path))
+
+    settings = Settings()
+
+    assert settings.pg_dsn == "postgresql://shakti:file@db.internal:5432/shakti"
