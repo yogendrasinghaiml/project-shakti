@@ -6,6 +6,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
@@ -24,9 +25,30 @@ SCHEMA_PATH = Path(
 )
 
 
+def redact_dsn(dsn: str) -> str:
+    parts = urlsplit(dsn)
+    if not parts.scheme or parts.hostname is None:
+        return dsn
+    auth_prefix = ""
+    if parts.username:
+        auth_prefix = f"{parts.username}:***@"
+    host = parts.hostname
+    port = f":{parts.port}" if parts.port is not None else ""
+    return urlunsplit(
+        (
+            parts.scheme,
+            f"{auth_prefix}{host}{port}",
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
+
+
 async def wait_for_database() -> None:
     deadline = time.time() + WAIT_TIMEOUT_SECONDS
     last_error = "unknown error"
+    redacted_dsn = redact_dsn(PG_DSN)
     while time.time() < deadline:
         try:
             conn = await asyncpg.connect(PG_DSN, timeout=CONNECT_TIMEOUT_SECONDS)
@@ -34,10 +56,10 @@ async def wait_for_database() -> None:
             await conn.close()
             return
         except Exception as exc:
-            last_error = str(exc)
+            last_error = str(exc).replace(PG_DSN, redacted_dsn)
             await asyncio.sleep(1)
     raise RuntimeError(
-        f"PostgreSQL at {PG_DSN} did not become ready within {WAIT_TIMEOUT_SECONDS:g}s: {last_error}"
+        f"PostgreSQL at {redacted_dsn} did not become ready within {WAIT_TIMEOUT_SECONDS:g}s: {last_error}"
     )
 
 

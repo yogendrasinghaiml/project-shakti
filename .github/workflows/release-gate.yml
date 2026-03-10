@@ -124,6 +124,9 @@ jobs:
       - name: Frontend build
         run: npm run build:frontend
 
+      - name: Mission Control bundle check
+        run: npm run check:mission-control
+
       - name: Wait for PostgreSQL
         run: |
           for i in {1..40}; do
@@ -141,6 +144,9 @@ jobs:
 
       - name: Backend live integration suite
         run: npm run test:backend:integration
+
+      - name: Staging compose render validation
+        run: docker compose --env-file ops/staging/staging.env.example -f docker-compose.yml -f docker-compose.staging.yml config > /tmp/project-shakti-staging.compose.yaml
 
       - name: Container build
         run: docker build -t project-shakti-api .
