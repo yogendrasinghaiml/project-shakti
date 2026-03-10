@@ -1,0 +1,86 @@
+name: project-shakti-staging
+
+services:
+  postgres:
+    container_name: shakti-postgres-staging
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your env file}
+    ports: !override
+      - "${SHAKTI_DB_PORT:-15432}:5432"
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  api:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER}/project-shakti-api:${SHAKTI_IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: shakti-api-staging
+    environment:
+      AUTH_SHARED_SECRET_PRIMARY: ${AUTH_SHARED_SECRET_PRIMARY:?set AUTH_SHARED_SECRET_PRIMARY}
+      PG_DSN: postgresql://shakti:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your env file}@postgres:5432/shakti
+      LOG_JSON: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_SLOW_QUERY_THRESHOLD_MS: ${DB_SLOW_QUERY_THRESHOLD_MS:-250}
+      MAX_INGEST_BYTES: ${MAX_INGEST_BYTES:-262144}
+      API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-240}
+      API_RATE_LIMIT_WINDOW_SECONDS: ${API_RATE_LIMIT_WINDOW_SECONDS:-60}
+      MQTT_ENABLED: ${MQTT_ENABLED:-false}
+      SHAKTI_APPLY_SCHEMA_ON_BOOT: ${SHAKTI_APPLY_SCHEMA_ON_BOOT:-true}
+    ports: !override
+      - "${SHAKTI_API_PORT:-18000}:8000"
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: shakti-postgres-exporter-staging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: postgresql://shakti:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/shakti?sslmode=disable
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: shakti-prometheus-staging
+    depends_on:
+      api:
+        condition: service_started
+      postgres-exporter:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "${PROMETHEUS_PORT:-19090}:9090"
+    volumes:
+      - ./ops/staging/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_staging_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: shakti-grafana-staging
+    depends_on:
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-localhost}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:13000}
+    ports:
+      - "${GRAFANA_PORT:-13000}:3000"
+    volumes:
+      - ./ops/staging/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/staging/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_staging_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  postgres_staging_data:
+  prometheus_staging_data:
+  grafana_staging_data:

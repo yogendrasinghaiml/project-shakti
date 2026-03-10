@@ -15,6 +15,7 @@ This runbook defines the standard branch, merge, tag, and rollback process for S
      - `git checkout main && git pull --ff-only`
      - `git tag -a vX.Y.Z -m "SHAKTI vX.Y.Z"`
      - `git push origin vX.Y.Z`
+7. Confirm the `publish-image` workflow pushes the multi-arch API image to GHCR for the new tag.
 
 ## Post-Release Verification
 1. Confirm local status is clean:

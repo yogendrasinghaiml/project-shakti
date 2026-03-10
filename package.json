@@ -2,7 +2,35 @@
   "name": "project-shakti",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20 <21"
+  },
   "scripts": {
+    "audit:frontend": "npm audit --audit-level=moderate",
+    "build:frontend": "vite build",
+    "check": "npm run lint:backend && npm run typecheck:backend && npm run typecheck:frontend && npm run build:frontend && npm run check:mission-control && npm test",
+    "check:mission-control": "./node_modules/.bin/esbuild SHAKTI_MissionControl.jsx --bundle --format=esm --platform=browser --jsx=automatic --outfile=/tmp/shakti-mission-control-check.js",
+    "dev:frontend": "vite --host 0.0.0.0",
+    "lint:backend": ".venv/bin/ruff check backend",
+    "typecheck:backend": ".venv/bin/python -m mypy --config-file backend/mypy.ini backend/intelligence_fusion_service.py",
+    "typecheck:frontend": "tsc --noEmit -p tsconfig.frontend.json",
+    "test": "npm run test:frontend && npm run test:backend",
+    "test:backend": ".venv/bin/pytest",
+    "test:backend:integration": "SHAKTI_RUN_INTEGRATION=1 .venv/bin/pytest -m integration backend/tests/test_live_postgres_integration.py",
     "test:frontend": "node --test frontend/tactical_helpers.test.mjs"
+  },
+  "dependencies": {
+    "leaflet": "1.9.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-leaflet": "4.2.1"
+  },
+  "devDependencies": {
+    "@types/leaflet": "1.9.21",
+    "@types/react": "18.3.28",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "5.1.4",
+    "typescript": "5.9.3",
+    "vite": "7.3.1"
   }
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ from backend.intelligence_fusion_service import (
     InMemoryReplayGuard,
     IntelObservationIn,
     IngestResult,
+    JsonLogFormatter,
     PostgresFusionRepository,
     Settings,
     build_auth_claim_headers,
@@ -677,6 +679,57 @@ def test_lifespan_skips_pool_creation_when_repository_is_injected(monkeypatch):
     assert app.state.stop_event.is_set()
 
 
+def test_lifespan_respects_settings_mqtt_enabled(monkeypatch):
+    def fail_create_task(_coro):
+        raise AssertionError("MQTT worker should not be created when MQTT is disabled.")
+
+    monkeypatch.setattr("backend.intelligence_fusion_service.asyncio.create_task", fail_create_task)
+    repo = FakeRepository()
+    app = create_app(settings=make_settings(mqtt_enabled=False), repository=repo)
+
+    with TestClient(app) as client:
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        assert app.state.repository is repo
+
+    assert app.state.stop_event.is_set()
+
+
+def test_metrics_endpoint_exposes_prometheus_metrics_and_request_id():
+    app = create_app(settings=make_settings(), repository=FakeRepository(), enable_mqtt=False)
+
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.headers["X-Request-ID"]
+
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "shakti_http_requests_total" in metrics.text
+        assert "shakti_http_request_duration_seconds" in metrics.text
+        assert "shakti_db_operations_total" in metrics.text
+
+
+def test_json_log_formatter_emits_structured_payload():
+    formatter = JsonLogFormatter()
+    record = logging.makeLogRecord(
+        {
+            "name": "shakti.intelligence_fusion",
+            "levelno": logging.INFO,
+            "levelname": "INFO",
+            "msg": "request_completed",
+            "request_id": "req-123",
+            "status_code": 200,
+        }
+    )
+
+    payload = json.loads(formatter.format(record))
+    assert payload["message"] == "request_completed"
+    assert payload["request_id"] == "req-123"
+    assert payload["status_code"] == 200
+    assert payload["level"] == "INFO"
+
+
 def test_settings_rejects_invalid_mqtt_service_user_id():
     with pytest.raises(ValueError, match="actor_user_id must be a valid UUID"):
         Settings(mqtt_service_user_id="not-a-uuid")
@@ -721,3 +774,13 @@ def test_settings_rejects_partial_mqtt_client_cert_configuration():
         ValueError, match="MQTT_TLS_CERT_FILE and MQTT_TLS_KEY_FILE must be provided together"
     ):
         Settings(mqtt_tls_cert_file="/tmp/client.crt", mqtt_tls_key_file="")
+
+
+def test_settings_rejects_invalid_log_level():
+    with pytest.raises(ValueError, match="LOG_LEVEL must be a valid Python logging level"):
+        Settings(log_level="LOUD")
+
+
+def test_settings_rejects_invalid_db_slow_query_threshold():
+    with pytest.raises(ValueError, match="DB_SLOW_QUERY_THRESHOLD_MS must be a positive number"):
+        Settings(db_slow_query_threshold_ms=0)

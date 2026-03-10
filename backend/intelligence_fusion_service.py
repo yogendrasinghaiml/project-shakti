@@ -17,11 +17,13 @@ from enum import Enum
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 try:
@@ -37,7 +39,137 @@ MqttError = AsyncIOMqttError
 
 
 logger = logging.getLogger("shakti.intelligence_fusion")
-logging.basicConfig(level=logging.INFO)
+_LOG_RECORD_RESERVED_KEYS = frozenset(logging.makeLogRecord({}).__dict__.keys())
+_LOG_LEVEL_NAMES = frozenset(logging.getLevelNamesMapping().keys())
+_LOGGING_STATE: tuple[str, bool] | None = None
+_DB_SLOW_QUERY_THRESHOLD_MS = float(os.getenv("DB_SLOW_QUERY_THRESHOLD_MS", "250"))
+
+HTTP_REQUESTS_TOTAL = Counter(
+    "shakti_http_requests_total",
+    "Total HTTP requests handled by the SHAKTI API.",
+    ("method", "path", "status"),
+)
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "shakti_http_request_duration_seconds",
+    "HTTP request duration in seconds.",
+    ("method", "path"),
+)
+HTTP_REQUESTS_IN_PROGRESS = Gauge(
+    "shakti_http_requests_in_progress",
+    "Current in-flight HTTP requests.",
+    ("method", "path"),
+)
+DB_OPERATIONS_TOTAL = Counter(
+    "shakti_db_operations_total",
+    "Total tracked PostgreSQL operations.",
+    ("operation", "status"),
+)
+DB_OPERATION_DURATION_SECONDS = Histogram(
+    "shakti_db_operation_duration_seconds",
+    "Tracked PostgreSQL operation duration in seconds.",
+    ("operation", "status"),
+)
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        extra_fields = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _LOG_RECORD_RESERVED_KEYS and not key.startswith("_")
+        }
+        if extra_fields:
+            payload.update(extra_fields)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=_json_default, separators=(",", ":"))
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, UUID):
+        return str(value)
+    return str(value)
+
+
+def configure_logging(log_level: str, json_logs: bool) -> None:
+    global _LOGGING_STATE
+
+    normalized_level = log_level.upper()
+    desired_state = (normalized_level, json_logs)
+    if _LOGGING_STATE == desired_state:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter() if json_logs else logging.Formatter("%(message)s"))
+    logging.basicConfig(level=normalized_level, handlers=[handler], force=True)
+    _LOGGING_STATE = desired_state
+
+
+def log_event(level: int, message: str, **fields: Any) -> None:
+    logger.log(level, message, extra=fields)
+
+
+def redact_dsn(dsn: str) -> str:
+    parts = urlsplit(dsn)
+    if not parts.scheme or parts.hostname is None:
+        return dsn
+    auth_prefix = ""
+    if parts.username:
+        auth_prefix = f"{parts.username}:***@"
+    host = parts.hostname
+    port = f":{parts.port}" if parts.port is not None else ""
+    return urlunsplit(
+        (
+            parts.scheme,
+            f"{auth_prefix}{host}{port}",
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
+
+
+async def _track_db_operation(
+    operation: str,
+    func,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    started_at = time.perf_counter()
+    status = "success"
+    try:
+        return await func(*args, **kwargs)
+    except Exception as exc:
+        status = "error"
+        log_event(
+            logging.ERROR,
+            "db_operation_failed",
+            operation=operation,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            error_type=type(exc).__name__,
+        )
+        raise
+    finally:
+        duration_s = time.perf_counter() - started_at
+        DB_OPERATIONS_TOTAL.labels(operation, status).inc()
+        DB_OPERATION_DURATION_SECONDS.labels(operation, status).observe(duration_s)
+        if status == "success" and duration_s * 1000 >= _DB_SLOW_QUERY_THRESHOLD_MS:
+            log_event(
+                logging.WARNING,
+                "db_operation_slow",
+                operation=operation,
+                duration_ms=round(duration_s * 1000, 3),
+            )
 
 
 class ClearanceLevel(str, Enum):
@@ -273,7 +405,9 @@ class PostgresRateLimiter:
 
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            await _track_db_operation(
+                "rate_limiter.ensure_schema.create_table",
+                conn.execute,
                 """
                 CREATE TABLE IF NOT EXISTS api_rate_limit_guard (
                   principal_key TEXT NOT NULL,
@@ -282,13 +416,15 @@ class PostgresRateLimiter:
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   PRIMARY KEY (principal_key, window_start)
                 )
-                """
+                """,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "rate_limiter.ensure_schema.create_index",
+                conn.execute,
                 """
                 CREATE INDEX IF NOT EXISTS idx_api_rate_limit_guard_window_start
                 ON api_rate_limit_guard (window_start)
-                """
+                """,
             )
 
     async def allow(self, key: str) -> bool:
@@ -299,11 +435,15 @@ class PostgresRateLimiter:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
+                await _track_db_operation(
+                    "rate_limiter.delete_expired",
+                    conn.execute,
                     "DELETE FROM api_rate_limit_guard WHERE window_start < $1",
                     expire_before,
                 )
-                row = await conn.fetchrow(
+                row = await _track_db_operation(
+                    "rate_limiter.fetch_window",
+                    conn.fetchrow,
                     """
                     SELECT request_count
                     FROM api_rate_limit_guard
@@ -315,7 +455,9 @@ class PostgresRateLimiter:
                     window_start,
                 )
                 if row is None:
-                    await conn.execute(
+                    await _track_db_operation(
+                        "rate_limiter.insert_window",
+                        conn.execute,
                         """
                         INSERT INTO api_rate_limit_guard (
                           principal_key,
@@ -333,7 +475,9 @@ class PostgresRateLimiter:
                 if request_count >= self.max_requests:
                     return False
 
-                await conn.execute(
+                await _track_db_operation(
+                    "rate_limiter.update_window",
+                    conn.execute,
                     """
                     UPDATE api_rate_limit_guard
                     SET request_count = request_count + 1,
@@ -357,29 +501,37 @@ class PostgresReplayGuard:
 
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            await _track_db_operation(
+                "replay_guard.ensure_schema.create_table",
+                conn.execute,
                 """
                 CREATE TABLE IF NOT EXISTS auth_claim_replay_guard (
                   jti UUID PRIMARY KEY,
                   expires_at TIMESTAMPTZ NOT NULL,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                """
+                """,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "replay_guard.ensure_schema.create_index",
+                conn.execute,
                 """
                 CREATE INDEX IF NOT EXISTS idx_auth_claim_replay_guard_expires_at
                 ON auth_claim_replay_guard (expires_at)
-                """
+                """,
             )
 
     async def mark_jti_seen(self, jti: str) -> bool:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
+                await _track_db_operation(
+                    "replay_guard.delete_expired",
+                    conn.execute,
                     "DELETE FROM auth_claim_replay_guard WHERE expires_at <= NOW()"
                 )
-                inserted = await conn.fetchval(
+                inserted = await _track_db_operation(
+                    "replay_guard.insert_jti",
+                    conn.fetchval,
                     """
                     INSERT INTO auth_claim_replay_guard (jti, expires_at)
                     VALUES ($1::uuid, $2)
@@ -459,6 +611,16 @@ class Settings:
         "PG_DSN",
         "postgresql://shakti:shakti@127.0.0.1:5432/shakti",
     )
+    log_level: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    log_json: bool = (
+        os.getenv("LOG_JSON", "true").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    db_slow_query_threshold_ms: float = float(
+        os.getenv("DB_SLOW_QUERY_THRESHOLD_MS", "250")
+    )
+    mqtt_enabled: bool = (
+        os.getenv("MQTT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    )
     mqtt_host: str = os.getenv("MQTT_HOST", "127.0.0.1")
     mqtt_port: int = int(os.getenv("MQTT_PORT", "1883"))
     mqtt_topic: str = os.getenv("MQTT_TOPIC", "shakti/intel/#")
@@ -516,6 +678,10 @@ class Settings:
     auth_active_shared_secrets: tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
+        if self.log_level not in _LOG_LEVEL_NAMES:
+            raise ValueError("LOG_LEVEL must be a valid Python logging level.")
+        if self.db_slow_query_threshold_ms <= 0:
+            raise ValueError("DB_SLOW_QUERY_THRESHOLD_MS must be a positive number.")
         if self.max_ingest_bytes < 1:
             raise ValueError("MAX_INGEST_BYTES must be a positive integer.")
         if self.api_rate_limit_requests < 1:
@@ -586,7 +752,9 @@ class PostgresFusionRepository:
         actor_clearance: ClearanceLevel,
     ) -> str:
         actor_uuid = normalize_actor_user_id(actor_user_id)
-        actor_row = await conn.fetchrow(
+        actor_row = await _track_db_operation(
+            "fusion.validate_actor",
+            conn.fetchrow,
             """
             SELECT clearance_level, is_active
             FROM users
@@ -620,16 +788,22 @@ class PostgresFusionRepository:
                     actor_user_id=actor_user_id,
                     actor_clearance=actor_clearance,
                 )
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.set_clearance_context",
+                    conn.execute,
                     "SELECT set_config('app.user_clearance', $1, true)",
                     actor_clearance.value,
                 )
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.acquire_target_lock",
+                    conn.execute,
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     observation.target_id,
                 )
 
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.upsert_target",
+                    conn.execute,
                     """
                     INSERT INTO targets (target_id, unit_type, canonical_classification, metadata, last_modified_by)
                     VALUES ($1, $2, $3, '{}'::jsonb, $4)
@@ -648,7 +822,9 @@ class PostgresFusionRepository:
                     actor_uuid,
                 )
 
-                previous = await conn.fetchrow(
+                previous = await _track_db_operation(
+                    "fusion.fetch_previous_observation",
+                    conn.fetchrow,
                     """
                     SELECT
                       observation_id,
@@ -666,7 +842,9 @@ class PostgresFusionRepository:
                     observation.source_id,
                 )
 
-                observation_id = await conn.fetchval(
+                observation_id = await _track_db_operation(
+                    "fusion.insert_observation",
+                    conn.fetchval,
                     """
                     INSERT INTO intel_observations (
                       target_id,
@@ -730,7 +908,9 @@ class PostgresFusionRepository:
                     observation.classification_marking,
                 )
 
-                conflict_id = await conn.fetchval(
+                conflict_id = await _track_db_operation(
+                    "fusion.insert_conflict",
+                    conn.fetchval,
                     """
                     INSERT INTO coordinate_conflicts (
                       target_id,
@@ -774,11 +954,15 @@ class PostgresFusionRepository:
                 actor_user_id=actor_user_id,
                 actor_clearance=actor_clearance,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "fusion.set_clearance_context",
+                conn.execute,
                 "SELECT set_config('app.user_clearance', $1, true)",
                 actor_clearance.value,
             )
-            rows = await conn.fetch(
+            rows = await _track_db_operation(
+                "fusion.fetch_pending_conflicts",
+                conn.fetch,
                 """
                 SELECT
                   conflict_id,
@@ -803,10 +987,15 @@ class PostgresFusionRepository:
 def create_app(
     settings: Settings | None = None,
     repository: FusionRepository | None = None,
-    enable_mqtt: bool = True,
+    enable_mqtt: bool | None = None,
     replay_guard: ReplayGuard | None = None,
 ) -> FastAPI:
+    global _DB_SLOW_QUERY_THRESHOLD_MS
+
     cfg = settings or Settings()
+    mqtt_enabled = cfg.mqtt_enabled if enable_mqtt is None else enable_mqtt
+    _DB_SLOW_QUERY_THRESHOLD_MS = cfg.db_slow_query_threshold_ms
+    configure_logging(cfg.log_level, cfg.log_json)
 
     def build_mqtt_tls_context() -> ssl.SSLContext | None:
         if not cfg.mqtt_tls_enabled:
@@ -941,7 +1130,9 @@ def create_app(
         app.state.mqtt_task = None
 
         if app.state.repository is None:
-            pool = await asyncpg.create_pool(
+            pool = await _track_db_operation(
+                "pool.create",
+                asyncpg.create_pool,
                 dsn=cfg.pg_dsn,
                 min_size=2,
                 max_size=10,
@@ -952,7 +1143,13 @@ def create_app(
                 pool=pool,
                 conflict_threshold_m=cfg.conflict_threshold_m,
             )
-            logger.info("Connected to PostgreSQL for Intelligence Fusion service.")
+            log_event(
+                logging.INFO,
+                "postgres_connected",
+                pg_dsn=redact_dsn(cfg.pg_dsn),
+                pool_min_size=2,
+                pool_max_size=10,
+            )
 
         if not cfg.auth_active_shared_secrets:
             raise RuntimeError(
@@ -980,7 +1177,7 @@ def create_app(
                     max_requests=cfg.api_rate_limit_requests,
                     window_seconds=cfg.api_rate_limit_window_seconds,
                 )
-        if enable_mqtt:
+        if mqtt_enabled:
             if cfg.mqtt_require_tls and not cfg.mqtt_tls_enabled:
                 raise RuntimeError(
                     "MQTT secure transport is required but MQTT_TLS_ENABLED is false."
@@ -1020,7 +1217,7 @@ def create_app(
                     ttl_seconds=cfg.auth_replay_ttl_seconds
                 )
 
-        if enable_mqtt:
+        if mqtt_enabled:
             app.state.mqtt_task = asyncio.create_task(mqtt_ingest_worker(app))
 
         try:
@@ -1226,9 +1423,61 @@ def create_app(
 
         return await call_next(request)
 
+    @app.middleware("http")
+    async def request_observability_middleware(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID", str(uuid4()))
+        request.state.request_id = request_id
+        request_path = request.url.path
+        request_method = request.method
+        request_started_at = time.perf_counter()
+        HTTP_REQUESTS_IN_PROGRESS.labels(request_method, request_path).inc()
+        response: Response | None = None
+        status_code = 500
+
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = request_id
+            return response
+        except Exception as exc:
+            log_event(
+                logging.ERROR,
+                "request_failed",
+                request_id=request_id,
+                method=request_method,
+                path=request_path,
+                status_code=status_code,
+                duration_ms=round((time.perf_counter() - request_started_at) * 1000, 3),
+                client_ip=request.client.host if request.client else None,
+                actor_user_id=getattr(request.state, "actor_user_id", None),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            duration_s = time.perf_counter() - request_started_at
+            HTTP_REQUESTS_IN_PROGRESS.labels(request_method, request_path).dec()
+            HTTP_REQUESTS_TOTAL.labels(request_method, request_path, str(status_code)).inc()
+            HTTP_REQUEST_DURATION_SECONDS.labels(request_method, request_path).observe(duration_s)
+            if response is not None:
+                log_event(
+                    logging.WARNING if status_code >= 400 else logging.INFO,
+                    "request_completed",
+                    request_id=request_id,
+                    method=request_method,
+                    path=request_path,
+                    status_code=status_code,
+                    duration_ms=round(duration_s * 1000, 3),
+                    client_ip=request.client.host if request.client else None,
+                    actor_user_id=getattr(request.state, "actor_user_id", None),
+                )
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/v1/ingest/hook", response_model=IngestResult)
     async def ingest_hook(observation: IntelObservationIn, request: Request) -> IngestResult:

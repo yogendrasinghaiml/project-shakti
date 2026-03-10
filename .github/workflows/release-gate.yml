@@ -51,6 +51,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Frontend dependency audit
+        run: npm run audit:frontend
 
       - name: Install PostgreSQL client
         run: |
@@ -111,6 +118,12 @@ jobs:
       - name: Backend type check
         run: python -m mypy --config-file backend/mypy.ini
 
+      - name: Frontend type check
+        run: npm run typecheck:frontend
+
+      - name: Frontend build
+        run: npm run build:frontend
+
       - name: Wait for PostgreSQL
         run: |
           for i in {1..40}; do
@@ -120,11 +133,14 @@ jobs:
           echo "PostgreSQL service was not ready in time." >&2
           exit 1
 
-      - name: Backend unit tests
-        run: python -m pytest backend/tests/test_intelligence_fusion_service.py -q
+      - name: Repo default test suite
+        run: npm test
 
-      - name: Backend full suite with coverage gate
-        run: python -m pytest backend/tests -q --cov=backend --cov-report=term-missing --cov-fail-under=70
+      - name: Backend coverage gate
+        run: python -m pytest backend/tests/test_intelligence_fusion_service.py -q --cov=backend --cov-report=term-missing --cov-fail-under=70
 
-      - name: Frontend tests
-        run: npm run test:frontend
+      - name: Backend live integration suite
+        run: npm run test:backend:integration
+
+      - name: Container build
+        run: docker build -t project-shakti-api .

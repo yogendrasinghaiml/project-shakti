@@ -2,11 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
+import ts from "typescript";
 
 function loadHelpersFromTypeScriptSource() {
   const tsPath = new URL("./tactical_helpers.ts", import.meta.url);
   const source = readFileSync(tsPath, "utf8");
-  const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2020,
+    },
+  }).outputText;
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled).toString("base64")}`;
   return import(moduleUrl);
 }
 

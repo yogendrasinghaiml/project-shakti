@@ -57,5 +57,8 @@ Audit performed on Phase 2-4 artifacts:
 ## Validation Status
 
 - Python syntax validation: passed via `py_compile`.
-- Pytest execution: not run in this environment (`pytest` not installed).
-
+- Backend linting: passed via `ruff check backend`.
+- Backend type checking: passed via `mypy` against `backend/intelligence_fusion_service.py`.
+- Frontend helper tests: passed via `node --test frontend/tactical_helpers.test.mjs`.
+- Backend pytest suite: `39 passed, 5 skipped` with live PostgreSQL integration gated behind explicit opt-in.
+- Live PostgreSQL integration suite: passed via `npm run test:backend:integration` against `docker-compose.test.yml` (`5 passed`).

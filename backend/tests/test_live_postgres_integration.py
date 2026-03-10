@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from uuid import uuid4
 
 import asyncpg
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.intelligence_fusion_service import (
@@ -25,6 +27,15 @@ TEST_AUTH_SECRET = "integration-shared-secret"
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[2] / "db" / "phase2_schema_postgres_postgis.sql"
 )
+RUN_INTEGRATION_ENV = "SHAKTI_RUN_INTEGRATION"
+DB_READY_TIMEOUT_SECONDS = float(os.getenv("SHAKTI_TEST_DB_READY_TIMEOUT_SECONDS", "10"))
+DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SHAKTI_TEST_DB_CONNECT_TIMEOUT_SECONDS", "1.5"))
+
+pytestmark = pytest.mark.integration
+
+
+def _integration_enabled() -> bool:
+    return os.getenv(RUN_INTEGRATION_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _run_psql(*args: str) -> None:
@@ -36,17 +47,19 @@ def _run_psql(*args: str) -> None:
     )
 
 
-async def _wait_for_db_ready_async(timeout_seconds: int = 60) -> None:
+async def _wait_for_db_ready_async(timeout_seconds: float = DB_READY_TIMEOUT_SECONDS) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            conn = await asyncpg.connect(TEST_PG_DSN)
+            conn = await asyncpg.connect(TEST_PG_DSN, timeout=DB_CONNECT_TIMEOUT_SECONDS)
             await conn.execute("SELECT 1")
             await conn.close()
             return
         except Exception:
-            await asyncio.sleep(1)
-    raise RuntimeError("PostgreSQL test database did not become ready in time.")
+            await asyncio.sleep(0.5)
+    raise RuntimeError(
+        f"PostgreSQL test database at {TEST_PG_DSN} did not become ready within {timeout_seconds:g}s."
+    )
 
 
 def _run_async(coro):
@@ -111,7 +124,20 @@ async def _seed_user(user_id: str, clearance: ClearanceLevel) -> None:
 
 
 def setup_module() -> None:
-    _run_async(_wait_for_db_ready_async())
+    if not _integration_enabled():
+        pytest.skip(
+            f"Set {RUN_INTEGRATION_ENV}=1 to run live PostgreSQL integration tests.",
+            allow_module_level=True,
+        )
+    if shutil.which("psql") is None:
+        pytest.skip(
+            "Skipping live PostgreSQL integration tests because `psql` is unavailable.",
+            allow_module_level=True,
+        )
+    try:
+        _run_async(_wait_for_db_ready_async())
+    except RuntimeError as exc:
+        pytest.skip(f"Skipping live PostgreSQL integration tests: {exc}", allow_module_level=True)
     _run_async(_reset_and_apply_schema())
 
 
