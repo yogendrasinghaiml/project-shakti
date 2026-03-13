@@ -6,16 +6,22 @@ Use the base compose file plus the staging override to run the API from a publis
 cp ops/staging/staging.env.example .env.staging
 POSTGRES_PASSWORD=replace-with-a-real-password \
 AUTH_SHARED_SECRET_PRIMARY=replace-with-a-real-secret \
+GRAFANA_ADMIN_PASSWORD=replace-with-a-real-password \
 ./ops/staging/render-secrets.sh
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml up -d
 ```
 
-The staging API now reads its auth rotation bundle and database DSN from mounted files in `ops/staging/secrets/`:
+The staging API, database, exporter, and Grafana now read credentials from mounted files in `ops/staging/secrets/`:
 
 - `auth_shared_secrets.json`
 - `api_pg_dsn`
+- `postgres_password`
+- `postgres_exporter_dsn`
+- `grafana_admin_user`
+- `grafana_admin_password`
 
-`./ops/staging/render-secrets.sh` creates both files with `0600` permissions.
+`./ops/staging/render-secrets.sh` creates these files with `0600` permissions.
+If `GRAFANA_ADMIN_PASSWORD` is omitted, the renderer generates one automatically.
 
 Default exposed ports:
 

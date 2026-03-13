@@ -90,6 +90,21 @@ Runbook and drill checklist:
 - `docs/backup_restore_runbook.md`
 - `docs/restore_drill_checklist.md`
 
+## Load Testing
+
+Run the phase-4 load harness:
+
+```bash
+.venv/bin/python ops/loadtest/run_phase4_load.py \
+  --base-url http://127.0.0.1:18080 \
+  --shared-secret load-test-secret \
+  --requests 300 \
+  --concurrency 20 \
+  --out /tmp/shakti_phase4_load_report.json
+```
+
+Targets and gate thresholds are documented in `docs/load_testing_and_slos.md`.
+
 ## Staging
 
 Use the staging override plus the published GHCR image:
@@ -98,16 +113,18 @@ Use the staging override plus the published GHCR image:
 cp ops/staging/staging.env.example .env.staging
 POSTGRES_PASSWORD=replace-with-a-real-password \
 AUTH_SHARED_SECRET_PRIMARY=replace-with-a-real-secret \
+GRAFANA_ADMIN_PASSWORD=replace-with-a-real-password \
 ./ops/staging/render-secrets.sh
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml run --rm api python /app/ops/db/migrate.py up
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml up -d
 ```
 
-This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. Alert rules are defined in `ops/staging/prometheus/alerts.yml`. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
+This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. Alert rules are defined in `ops/staging/prometheus/alerts.yml`. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`, including file-backed credentials for PostgreSQL, exporter, and Grafana.
 
 ## Production Plan
 
 The current production hardening task list is tracked in `docs/production_readiness_plan.md`.
+External secret manager reference patterns are documented in `docs/external_secret_manager_examples.md`.
 
 ## Image Publishing
 

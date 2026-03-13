@@ -11,6 +11,7 @@
     "check": "npm run lint:backend && npm run typecheck:backend && npm run typecheck:frontend && npm run build:frontend && npm run check:mission-control && npm test",
     "check:mission-control": "./node_modules/.bin/esbuild SHAKTI_MissionControl.jsx --bundle --format=esm --platform=browser --jsx=automatic --outfile=/tmp/shakti-mission-control-check.js",
     "dev:frontend": "vite --host 0.0.0.0",
+    "load:phase4": ".venv/bin/python ops/loadtest/run_phase4_load.py",
     "lint:backend": ".venv/bin/ruff check backend",
     "typecheck:backend": ".venv/bin/python -m mypy --config-file backend/mypy.ini backend/intelligence_fusion_service.py",
     "typecheck:frontend": "tsc --noEmit -p tsconfig.frontend.json",

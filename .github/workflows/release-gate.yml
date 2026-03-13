@@ -74,6 +74,7 @@ jobs:
           bash -n ops/db/backup_postgres.sh
           bash -n ops/db/restore_postgres.sh
           bash -n ops/docker-entrypoint.sh
+          python -m py_compile ops/loadtest/run_phase4_load.py
 
       - name: Secret hygiene scan
         run: |
@@ -158,6 +159,38 @@ jobs:
 
       - name: Backend live integration suite
         run: npm run test:backend:integration
+
+      - name: Phase-4 load smoke gate
+        run: |
+          AUTH_SHARED_SECRET_PRIMARY=phase4-load-secret \
+          PG_DSN="$SHAKTI_TEST_PG_DSN" \
+          MQTT_ENABLED=false \
+          API_RATE_LIMIT_ENABLED=false \
+          .venv/bin/python -m uvicorn backend.intelligence_fusion_service:app --host 127.0.0.1 --port 18080 --no-access-log &
+          api_pid=$!
+          trap "kill $api_pid" EXIT
+          ready=0
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "API did not become ready in time for load smoke gate." >&2
+            exit 1
+          fi
+          .venv/bin/python ops/loadtest/run_phase4_load.py \
+            --base-url http://127.0.0.1:18080 \
+            --shared-secret phase4-load-secret \
+            --requests 80 \
+            --concurrency 8 \
+            --max-p95-ms 1200 \
+            --max-p99-ms 2000 \
+            --max-error-rate-pct 5 \
+            --min-success-rate-pct 95 \
+            --out /tmp/shakti_phase4_load_ci.json
 
       - name: Staging compose render validation
         run: docker compose --env-file ops/staging/staging.env.example -f docker-compose.yml -f docker-compose.staging.yml config > /tmp/project-shakti-staging.compose.yaml

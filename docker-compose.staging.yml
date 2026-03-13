@@ -4,11 +4,13 @@ services:
   postgres:
     container_name: shakti-postgres-staging
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your env file}
+      POSTGRES_PASSWORD: !reset null
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     ports: !override
       - "${SHAKTI_DB_PORT:-15432}:5432"
     volumes:
       - postgres_staging_data:/var/lib/postgresql/data
+      - ./ops/staging/secrets:/run/secrets:ro
     restart: unless-stopped
 
   api:
@@ -41,8 +43,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      DATA_SOURCE_NAME: postgresql://shakti:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/shakti?sslmode=disable
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        export DATA_SOURCE_NAME="$(cat /run/secrets/postgres_exporter_dsn)"
+        exec postgres_exporter
+    volumes:
+      - ./ops/staging/secrets:/run/secrets:ro
     restart: unless-stopped
 
   prometheus:
@@ -72,8 +81,8 @@ services:
       prometheus:
         condition: service_started
     environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_ADMIN_USER__FILE: /run/secrets/grafana_admin_user
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-localhost}
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:13000}
@@ -83,6 +92,7 @@ services:
       - ./ops/staging/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./ops/staging/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_staging_data:/var/lib/grafana
+      - ./ops/staging/secrets:/run/secrets:ro
     restart: unless-stopped
 
 volumes:

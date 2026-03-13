@@ -7,8 +7,8 @@ This checklist tracks the remaining work to move SHAKTI from staging-grade to pr
 - [x] Add file-backed secret loading for the API runtime (`*_FILE` support for critical secrets)
 - [x] Move staging API auth and database DSN to mounted secret files
 - [x] Add a staging secret rendering utility and secret directory contract
-- [ ] Move database/exporter/Grafana credentials to secret-file wiring where supported
-- [ ] Add external secret manager examples for Kubernetes and cloud deployments
+- [x] Move database/exporter/Grafana credentials to secret-file wiring where supported
+- [x] Add external secret manager examples for Kubernetes and cloud deployments
 
 ## Phase 2: Database Migrations And Rollback
 
@@ -26,9 +26,9 @@ This checklist tracks the remaining work to move SHAKTI from staging-grade to pr
 
 ## Phase 4: Load Testing And Capacity Limits
 
-- [ ] Add a load-testing harness for ingest and conflict retrieval flows
-- [ ] Define baseline SLO targets and max tested concurrency
-- [ ] Capture p95/p99 latency and error-rate thresholds in docs
+- [x] Add a load-testing harness for ingest and conflict retrieval flows
+- [x] Define baseline SLO targets and max tested concurrency
+- [x] Capture p95/p99 latency and error-rate thresholds in docs
 
 ## Phase 5: Real Deployment Targets
 
