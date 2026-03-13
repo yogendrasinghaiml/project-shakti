@@ -12,10 +12,10 @@ This checklist tracks the remaining work to move SHAKTI from staging-grade to pr
 
 ## Phase 2: Database Migrations And Rollback
 
-- [ ] Introduce a versioned migration table and migration runner
-- [ ] Split the current schema bootstrap into ordered migration files
-- [ ] Make schema-on-boot dev-only and require explicit migrations in staging/prod
-- [ ] Add rollback and drift-check commands
+- [x] Introduce a versioned migration table and migration runner
+- [x] Split the current schema bootstrap into ordered migration files
+- [x] Make schema-on-boot dev-only and require explicit migrations in staging/prod
+- [x] Add rollback and drift-check commands
 
 ## Phase 3: Backup, Restore, DR, And Alerting
 

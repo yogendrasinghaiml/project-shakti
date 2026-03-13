@@ -4,7 +4,7 @@
 
 Audit performed on Phase 2-4 artifacts:
 
-- `db/phase2_schema_postgres_postgis.sql`
+- `db/migrations/0001_phase2_foundation.up.sql`
 - `backend/intelligence_fusion_service.py`
 - `frontend/TacticalMapView.tsx`
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -24,9 +24,7 @@ TEST_PG_DSN = os.getenv(
     "postgresql://shakti:shakti@127.0.0.1:55432/shakti",
 )
 TEST_AUTH_SECRET = "integration-shared-secret"
-SCHEMA_PATH = (
-    Path(__file__).resolve().parents[2] / "db" / "phase2_schema_postgres_postgis.sql"
-)
+MIGRATION_RUNNER = Path(__file__).resolve().parents[2] / "ops" / "db" / "migrate.py"
 RUN_INTEGRATION_ENV = "SHAKTI_RUN_INTEGRATION"
 DB_READY_TIMEOUT_SECONDS = float(os.getenv("SHAKTI_TEST_DB_READY_TIMEOUT_SECONDS", "10"))
 DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SHAKTI_TEST_DB_CONNECT_TIMEOUT_SECONDS", "1.5"))
@@ -38,9 +36,9 @@ def _integration_enabled() -> bool:
     return os.getenv(RUN_INTEGRATION_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _run_psql(*args: str) -> None:
+def _run_migration_cli(*args: str) -> None:
     subprocess.run(
-        ["psql", TEST_PG_DSN, "-v", "ON_ERROR_STOP=1", *args],
+        [sys.executable, str(MIGRATION_RUNNER), "--dsn", TEST_PG_DSN, *args],
         check=True,
         capture_output=True,
         text=True,
@@ -67,8 +65,17 @@ def _run_async(coro):
 
 
 async def _reset_and_apply_schema() -> None:
-    _run_psql("-c", "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
-    _run_psql("-f", str(SCHEMA_PATH))
+    await _execute(
+        """
+        DROP SCHEMA IF EXISTS shakti_meta CASCADE;
+        DROP SCHEMA IF EXISTS public CASCADE;
+        CREATE SCHEMA public;
+        GRANT ALL ON SCHEMA public TO CURRENT_USER;
+        GRANT ALL ON SCHEMA public TO PUBLIC;
+        """
+    )
+    _run_migration_cli("up")
+    _run_migration_cli("drift-check", "--require-up-to-date")
 
 
 async def _fetchval(query: str, *args):
@@ -127,11 +134,6 @@ def setup_module() -> None:
     if not _integration_enabled():
         pytest.skip(
             f"Set {RUN_INTEGRATION_ENV}=1 to run live PostgreSQL integration tests.",
-            allow_module_level=True,
-        )
-    if shutil.which("psql") is None:
-        pytest.skip(
-            "Skipping live PostgreSQL integration tests because `psql` is unavailable.",
             allow_module_level=True,
         )
     try:
@@ -203,6 +205,22 @@ def test_schema_has_persistent_api_rate_limit_guard():
     assert table_exists is True
     assert index_exists is True
     assert pk_exists is True
+
+
+def test_schema_migration_history_is_recorded():
+    rows = _run_async(
+        _fetch(
+            """
+            SELECT version, name
+            FROM shakti_meta.schema_migrations
+            ORDER BY sequence_id
+            """
+        )
+    )
+    assert rows == [
+        {"version": "0001", "name": "phase2_foundation"},
+        {"version": "0002", "name": "runtime_guards"},
+    ]
 
 
 def test_live_api_enforces_actor_provisioning_and_conflict_flow():

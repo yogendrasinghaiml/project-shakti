@@ -16,7 +16,7 @@ It also defines replay-guard requirements for production deployments.
 
 1. Persistent replay guard must be enabled:
    - `AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD=true`
-2. Database migration including `auth_claim_replay_guard` must be applied.
+2. Database migration including `auth_claim_replay_guard` must be applied (`python ops/db/migrate.py up`).
 3. Gateway and service clocks must be NTP-synchronized.
 4. New secret must be generated from a CSPRNG and stored in a secret manager.
 

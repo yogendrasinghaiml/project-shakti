@@ -1221,7 +1221,6 @@ def create_app(
                     max_requests=cfg.api_rate_limit_requests,
                     window_seconds=cfg.api_rate_limit_window_seconds,
                 )
-                await pg_rate_limiter.ensure_schema()
                 app.state.rate_limiter = pg_rate_limiter
             else:
                 if cfg.api_rate_limit_require_persistent:
@@ -1260,7 +1259,6 @@ def create_app(
                     pool=app.state.pool,
                     ttl_seconds=cfg.auth_replay_ttl_seconds,
                 )
-                await pg_replay_guard.ensure_schema()
                 app.state.replay_guard = pg_replay_guard
             else:
                 if cfg.auth_require_persistent_replay_guard:

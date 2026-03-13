@@ -30,7 +30,7 @@ services:
       MQTT_ENABLED: "false"
       MQTT_REQUIRE_AUTH: "false"
       MQTT_REQUIRE_TLS: "false"
-      SHAKTI_APPLY_SCHEMA_ON_BOOT: "true"
+      SHAKTI_DB_MIGRATION_MODE: "auto"
       SHAKTI_DB_WAIT_TIMEOUT_SECONDS: "90"
     ports:
       - "8000:8000"

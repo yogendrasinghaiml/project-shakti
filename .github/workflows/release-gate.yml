@@ -136,6 +136,14 @@ jobs:
           echo "PostgreSQL service was not ready in time." >&2
           exit 1
 
+      - name: Migration flow smoke check
+        run: |
+          python ops/db/migrate.py --dsn "$SHAKTI_TEST_PG_DSN" down --to 0
+          python ops/db/migrate.py --dsn "$SHAKTI_TEST_PG_DSN" up
+          python ops/db/migrate.py --dsn "$SHAKTI_TEST_PG_DSN" drift-check --require-up-to-date
+          python ops/db/migrate.py --dsn "$SHAKTI_TEST_PG_DSN" down --steps 1
+          python ops/db/migrate.py --dsn "$SHAKTI_TEST_PG_DSN" up
+
       - name: Repo default test suite
         run: npm test
 

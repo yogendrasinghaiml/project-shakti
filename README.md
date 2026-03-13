@@ -3,7 +3,7 @@
 Minimal multi-surface SHAKTI repo containing:
 
 - A hardened FastAPI intelligence-fusion service in `backend/intelligence_fusion_service.py`
-- A Postgres/PostGIS schema in `db/phase2_schema_postgres_postgis.sql`
+- Versioned Postgres/PostGIS migrations in `db/migrations/`
 - Tactical map helper code in `frontend/TacticalMapView.tsx` and `frontend/tactical_helpers.ts`
 
 ## Local Setup
@@ -38,7 +38,7 @@ npm run build:frontend
 npm run audit:frontend
 ```
 
-Live Postgres integration tests are opt-in and require `psql` plus a reachable database at `SHAKTI_TEST_PG_DSN`:
+Live Postgres integration tests are opt-in and require a reachable database at `SHAKTI_TEST_PG_DSN`:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d postgres
@@ -56,7 +56,20 @@ cp .env.example .env
 docker compose up --build
 ```
 
-This stack waits for PostgreSQL, applies the schema on boot, disables MQTT by default for local runs, and serves the API at `http://127.0.0.1:8000/healthz`.
+This stack waits for PostgreSQL, auto-applies pending migrations in local mode, disables MQTT by default for local runs, and serves the API at `http://127.0.0.1:8000/healthz`.
+
+## Database Migrations
+
+Run migrations directly from your host:
+
+```bash
+python ops/db/migrate.py status
+python ops/db/migrate.py up
+python ops/db/migrate.py drift-check --require-up-to-date
+python ops/db/migrate.py down --steps 1
+```
+
+By default, local Docker uses `SHAKTI_DB_MIGRATION_MODE=auto` so pending migrations are applied automatically at startup.
 
 ## Staging
 
@@ -67,10 +80,11 @@ cp ops/staging/staging.env.example .env.staging
 POSTGRES_PASSWORD=replace-with-a-real-password \
 AUTH_SHARED_SECRET_PRIMARY=replace-with-a-real-secret \
 ./ops/staging/render-secrets.sh
+docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml run --rm api python /app/ops/db/migrate.py up
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml up -d
 ```
 
-This adds Prometheus, Grafana, and PostgreSQL exporter around the API. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
+This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
 
 ## Production Plan
 
