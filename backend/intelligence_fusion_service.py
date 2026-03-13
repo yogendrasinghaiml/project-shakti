@@ -27,6 +27,17 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 try:
+    import jwt
+    from jwt import InvalidTokenError, PyJWKClient
+except Exception:  # pragma: no cover - optional dependency in constrained environments
+    jwt = None
+
+    class InvalidTokenError(Exception):  # type: ignore[no-redef]
+        pass
+
+    PyJWKClient = None
+
+try:
     from asyncio_mqtt import Client as MQTTClient
     from asyncio_mqtt import MqttError as AsyncIOMqttError
 except Exception:  # pragma: no cover - optional dependency during local scaffolding
@@ -193,6 +204,8 @@ CLEARANCE_RANK: dict[ClearanceLevel, int] = {
 SYSTEM_ACTOR_UUID = "00000000-0000-0000-0000-000000000000"
 AUTH_CLAIMS_HEADER = "X-Auth-Claims"
 AUTH_SIGNATURE_HEADER = "X-Auth-Signature"
+AUTH_BEARER_HEADER = "Authorization"
+AUTH_TOKEN_HEADER = "X-Auth-Token"
 AUTH_DEFAULT_AUDIENCE = "shakti-intelligence-fusion"
 
 
@@ -332,6 +345,78 @@ def verify_auth_claims(
         raise ValueError("Authentication claims timestamp outside allowed skew.")
 
     return actor_user_id, user_clearance, jti
+
+
+def extract_bearer_token(headers: Any) -> str:
+    authorization = str(headers.get(AUTH_BEARER_HEADER, "")).strip()
+    if authorization:
+        prefix, _, token = authorization.partition(" ")
+        if prefix.lower() == "bearer" and token.strip():
+            return token.strip()
+
+    raw_token = str(headers.get(AUTH_TOKEN_HEADER, "")).strip()
+    if raw_token:
+        return raw_token
+    raise ValueError(
+        f"Missing bearer token. Provide {AUTH_BEARER_HEADER}: Bearer <token> "
+        f"or {AUTH_TOKEN_HEADER}."
+    )
+
+
+class JwtJwksAuthValidator:
+    def __init__(
+        self,
+        *,
+        jwks_url: str,
+        issuer: str,
+        audience: str,
+        algorithms: tuple[str, ...],
+        max_skew_seconds: int,
+    ) -> None:
+        if jwt is None or PyJWKClient is None:
+            raise RuntimeError("JWT/JWKS auth strategy requires pyjwt[crypto] at runtime.")
+        self.jwks_url = jwks_url
+        self.issuer = issuer
+        self.audience = audience
+        self.algorithms = algorithms
+        self.max_skew_seconds = max_skew_seconds
+        self._jwk_client = PyJWKClient(jwks_url)
+
+    def verify_token(self, token: str) -> tuple[str, ClearanceLevel, str]:
+        try:
+            signing_key = self._jwk_client.get_signing_key_from_jwt(token)
+            claims = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=list(self.algorithms),
+                audience=self.audience,
+                issuer=self.issuer,
+                leeway=self.max_skew_seconds,
+                options={"require": ["iss", "aud", "iat", "jti"]},
+            )
+        except InvalidTokenError as exc:
+            raise ValueError("Invalid bearer token.") from exc
+        except Exception as exc:  # pragma: no cover - network/JWKS fetch errors
+            raise ValueError("Failed to validate bearer token with JWKS.") from exc
+
+        if not isinstance(claims, dict):
+            raise ValueError("Invalid bearer token payload.")
+
+        subject_raw = claims.get("sub", claims.get("user_id"))
+        if subject_raw is None:
+            raise ValueError("Bearer token is missing subject.")
+        actor_user_id = normalize_actor_user_id(str(subject_raw))
+
+        clearance_raw = claims.get("clearance")
+        if clearance_raw is None:
+            raise ValueError("Bearer token is missing clearance claim.")
+        user_clearance = ClearanceLevel(str(clearance_raw))
+        try:
+            jti = str(UUID(str(claims["jti"])))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("Bearer token jti must be a UUID.") from exc
+
+        return actor_user_id, user_clearance, jti
 
 
 class ReplayGuard(Protocol):
@@ -643,6 +728,18 @@ class ConflictOut(BaseModel):
     created_at: datetime
 
 
+class RecentObservationOut(BaseModel):
+    observation_id: UUID
+    target_id: str
+    source_id: str
+    source_type: SourceType
+    classification_marking: ClearanceLevel
+    observed_at: datetime
+    lat: float
+    lon: float
+    unit_type: str
+
+
 @dataclass
 class Settings:
     pg_dsn: str = field(
@@ -718,9 +815,21 @@ class Settings:
     auth_shared_secrets_file: str = field(
         default_factory=lambda: load_text_value("AUTH_SHARED_SECRETS_FILE", "")
     )
+    auth_strategy: str = field(
+        default_factory=lambda: load_text_value("AUTH_STRATEGY", "shared_secret").lower()
+    )
     auth_expected_audience: str = field(
         default_factory=lambda: load_text_value("AUTH_EXPECTED_AUDIENCE", AUTH_DEFAULT_AUDIENCE)
     )
+    auth_jwks_url: str = field(default_factory=lambda: load_text_value("AUTH_JWKS_URL", ""))
+    auth_jwt_issuer: str = field(default_factory=lambda: load_text_value("AUTH_JWT_ISSUER", ""))
+    auth_jwt_audience: str = field(
+        default_factory=lambda: load_text_value("AUTH_JWT_AUDIENCE", AUTH_DEFAULT_AUDIENCE)
+    )
+    auth_jwt_algorithms_raw: str = field(
+        default_factory=lambda: load_text_value("AUTH_JWT_ALGORITHMS", "RS256")
+    )
+    auth_jwt_algorithms: tuple[str, ...] = field(init=False, default=())
     auth_max_skew_seconds: int = field(
         default_factory=lambda: load_int_value("AUTH_MAX_SKEW_SECONDS", 300)
     )
@@ -754,8 +863,24 @@ class Settings:
             raise ValueError("AUTH_REPLAY_TTL_SECONDS must be a positive integer.")
         if self.auth_max_claims_bytes < 256:
             raise ValueError("AUTH_MAX_CLAIMS_BYTES must be at least 256 bytes.")
+        if self.auth_strategy not in {"shared_secret", "jwt_jwks"}:
+            raise ValueError("AUTH_STRATEGY must be either 'shared_secret' or 'jwt_jwks'.")
         if not self.auth_expected_audience.strip():
             raise ValueError("AUTH_EXPECTED_AUDIENCE must not be empty.")
+        if self.auth_strategy == "jwt_jwks":
+            if not self.auth_jwks_url.strip():
+                raise ValueError("AUTH_JWKS_URL must be set when AUTH_STRATEGY=jwt_jwks.")
+            if not self.auth_jwt_issuer.strip():
+                raise ValueError("AUTH_JWT_ISSUER must be set when AUTH_STRATEGY=jwt_jwks.")
+            if not self.auth_jwt_audience.strip():
+                raise ValueError("AUTH_JWT_AUDIENCE must be set when AUTH_STRATEGY=jwt_jwks.")
+
+        auth_jwt_algorithms = [
+            item.strip().upper() for item in self.auth_jwt_algorithms_raw.split(",") if item.strip()
+        ]
+        if self.auth_strategy == "jwt_jwks" and not auth_jwt_algorithms:
+            raise ValueError("AUTH_JWT_ALGORITHMS must define at least one algorithm.")
+        self.auth_jwt_algorithms = tuple(dict.fromkeys(auth_jwt_algorithms))
         if bool(self.mqtt_tls_cert_file.strip()) != bool(self.mqtt_tls_key_file.strip()):
             raise ValueError(
                 "MQTT_TLS_CERT_FILE and MQTT_TLS_KEY_FILE must be provided together."
@@ -795,6 +920,14 @@ class FusionRepository(Protocol):
         actor_clearance: ClearanceLevel,
         limit: int = 100,
     ) -> list[ConflictOut]:
+        ...
+
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ) -> list[RecentObservationOut]:
         ...
 
 
@@ -1041,6 +1174,48 @@ class PostgresFusionRepository:
             )
             return [ConflictOut(**dict(row)) for row in rows]
 
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ) -> list[RecentObservationOut]:
+        safe_limit = max(1, min(limit, 500))
+        async with self.pool.acquire() as conn:
+            await self._validate_actor(
+                conn=conn,
+                actor_user_id=actor_user_id,
+                actor_clearance=actor_clearance,
+            )
+            await _track_db_operation(
+                "fusion.set_clearance_context",
+                conn.execute,
+                "SELECT set_config('app.user_clearance', $1, true)",
+                actor_clearance.value,
+            )
+            rows = await _track_db_operation(
+                "fusion.fetch_recent_observations",
+                conn.fetch,
+                """
+                SELECT
+                  io.observation_id,
+                  io.target_id,
+                  io.source_id,
+                  io.source_type,
+                  io.classification_marking,
+                  io.observed_at,
+                  ST_Y(io.location::geometry) AS lat,
+                  ST_X(io.location::geometry) AS lon,
+                  t.unit_type
+                FROM intel_observations io
+                JOIN targets t ON t.target_id = io.target_id
+                ORDER BY io.observed_at DESC
+                LIMIT $1
+                """,
+                safe_limit,
+            )
+            return [RecentObservationOut(**dict(row)) for row in rows]
+
 
 def create_app(
     settings: Settings | None = None,
@@ -1054,6 +1229,15 @@ def create_app(
     mqtt_enabled = cfg.mqtt_enabled if enable_mqtt is None else enable_mqtt
     _DB_SLOW_QUERY_THRESHOLD_MS = cfg.db_slow_query_threshold_ms
     configure_logging(cfg.log_level, cfg.log_json)
+    jwt_auth_validator: JwtJwksAuthValidator | None = None
+    if cfg.auth_strategy == "jwt_jwks":
+        jwt_auth_validator = JwtJwksAuthValidator(
+            jwks_url=cfg.auth_jwks_url,
+            issuer=cfg.auth_jwt_issuer,
+            audience=cfg.auth_jwt_audience,
+            algorithms=cfg.auth_jwt_algorithms,
+            max_skew_seconds=cfg.auth_max_skew_seconds,
+        )
 
     def build_mqtt_tls_context() -> ssl.SSLContext | None:
         if not cfg.mqtt_tls_enabled:
@@ -1209,7 +1393,7 @@ def create_app(
                 pool_max_size=10,
             )
 
-        if not cfg.auth_active_shared_secrets:
+        if cfg.auth_strategy == "shared_secret" and not cfg.auth_active_shared_secrets:
             raise RuntimeError(
                 "At least one authentication shared secret must be configured "
                 "(AUTH_SHARED_SECRET_PRIMARY or AUTH_SHARED_SECRET_SECONDARY)."
@@ -1246,32 +1430,33 @@ def create_app(
                     "MQTT authentication is required but MQTT_USERNAME/MQTT_PASSWORD are not configured."
                 )
 
-        if cfg.auth_require_persistent_replay_guard and isinstance(
-            app.state.replay_guard, InMemoryReplayGuard
-        ):
-            raise RuntimeError(
-                "Persistent replay guard is required; InMemoryReplayGuard is not allowed."
-            )
+        if cfg.auth_strategy == "shared_secret":
+            if cfg.auth_require_persistent_replay_guard and isinstance(
+                app.state.replay_guard, InMemoryReplayGuard
+            ):
+                raise RuntimeError(
+                    "Persistent replay guard is required; InMemoryReplayGuard is not allowed."
+                )
 
-        if app.state.replay_guard is None:
-            if app.state.pool is not None:
-                pg_replay_guard = PostgresReplayGuard(
-                    pool=app.state.pool,
-                    ttl_seconds=cfg.auth_replay_ttl_seconds,
-                )
-                app.state.replay_guard = pg_replay_guard
-            else:
-                if cfg.auth_require_persistent_replay_guard:
-                    raise RuntimeError(
-                        "Persistent replay guard is required but no PostgreSQL pool or "
-                        "external replay_guard is available."
+            if app.state.replay_guard is None:
+                if app.state.pool is not None:
+                    pg_replay_guard = PostgresReplayGuard(
+                        pool=app.state.pool,
+                        ttl_seconds=cfg.auth_replay_ttl_seconds,
                     )
-                logger.warning(
-                    "Using in-memory replay guard because no PostgreSQL pool is available."
-                )
-                app.state.replay_guard = InMemoryReplayGuard(
-                    ttl_seconds=cfg.auth_replay_ttl_seconds
-                )
+                    app.state.replay_guard = pg_replay_guard
+                else:
+                    if cfg.auth_require_persistent_replay_guard:
+                        raise RuntimeError(
+                            "Persistent replay guard is required but no PostgreSQL pool or "
+                            "external replay_guard is available."
+                        )
+                    logger.warning(
+                        "Using in-memory replay guard because no PostgreSQL pool is available."
+                    )
+                    app.state.replay_guard = InMemoryReplayGuard(
+                        ttl_seconds=cfg.auth_replay_ttl_seconds
+                    )
 
         if mqtt_enabled:
             app.state.mqtt_task = asyncio.create_task(mqtt_ingest_worker(app))
@@ -1317,11 +1502,23 @@ def create_app(
     async def validate_gateway_identity(
         request: Request,
     ) -> tuple[str, ClearanceLevel, str] | JSONResponse:
-        if not cfg.auth_active_shared_secrets:
-            return auth_error_response(
-                status_code=503,
-                detail="No active authentication shared secrets are configured.",
-            )
+        if cfg.auth_strategy == "jwt_jwks":
+            if jwt_auth_validator is None:
+                return auth_error_response(
+                    status_code=503,
+                    detail="JWT/JWKS authentication validator is unavailable.",
+                )
+            try:
+                token = extract_bearer_token(request.headers)
+                return jwt_auth_validator.verify_token(token)
+            except ValueError as exc:
+                message = str(exc)
+                if message in {
+                    "Invalid bearer token.",
+                    "Failed to validate bearer token with JWKS.",
+                }:
+                    return auth_error_response(status_code=401, detail=message)
+                return auth_error_response(status_code=400, detail=message)
 
         claims_b64 = request.headers.get(AUTH_CLAIMS_HEADER)
         signature = request.headers.get(AUTH_SIGNATURE_HEADER)
@@ -1422,17 +1619,18 @@ def create_app(
                         status_code=429,
                         detail="Rate limit exceeded for API access.",
                     )
-            replay_guard_instance = app.state.replay_guard
-            if replay_guard_instance is None:
-                return auth_error_response(
-                    status_code=503,
-                    detail="Replay protection is unavailable.",
-                )
-            if not await replay_guard_instance.mark_jti_seen(jti):
-                return auth_error_response(
-                    status_code=401,
-                    detail="Authentication token replay detected.",
-                )
+            if cfg.auth_strategy == "shared_secret":
+                replay_guard_instance = app.state.replay_guard
+                if replay_guard_instance is None:
+                    return auth_error_response(
+                        status_code=503,
+                        detail="Replay protection is unavailable.",
+                    )
+                if not await replay_guard_instance.mark_jti_seen(jti):
+                    return auth_error_response(
+                        status_code=401,
+                        detail="Authentication token replay detected.",
+                    )
             request.state.actor_user_id = actor_user_id
             request.state.user_clearance = user_clearance
 
@@ -1574,6 +1772,29 @@ def create_app(
 
         try:
             return await app.state.repository.pending_conflicts_for_clearance(
+                actor_user_id=actor_user_id,
+                actor_clearance=user_clearance,
+                limit=limit,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.get("/v1/observations/recent", response_model=list[RecentObservationOut])
+    async def get_recent_observations(
+        request: Request, limit: int = 200
+    ) -> list[RecentObservationOut]:
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 500.")
+
+        user_clearance = getattr(request.state, "user_clearance", None)
+        if user_clearance is None:
+            raise HTTPException(status_code=401, detail="Missing validated user clearance.")
+        actor_user_id = getattr(request.state, "actor_user_id", None)
+        if actor_user_id is None:
+            raise HTTPException(status_code=401, detail="Missing validated actor identity.")
+
+        try:
+            return await app.state.repository.recent_observations_for_clearance(
                 actor_user_id=actor_user_id,
                 actor_clearance=user_clearance,
                 limit=limit,

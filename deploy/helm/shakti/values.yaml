@@ -1,0 +1,122 @@
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+revisionHistoryLimit: 5
+
+image:
+  repository: ghcr.io/your-ghcr-owner/project-shakti-api
+  tag: latest
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+rollingUpdate:
+  maxUnavailable: 0
+  maxSurge: 1
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 768Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+secretMounts:
+  auth:
+    create: true
+    existingSecret: ""
+    nameOverride: ""
+    key: auth_shared_secrets.json
+    sharedSecretsJson: '{"primary":"replace-me","secondary":""}'
+  db:
+    create: true
+    existingSecret: ""
+    nameOverride: ""
+    key: pg_dsn
+    dsn: ""
+
+env:
+  logJson: true
+  logLevel: INFO
+  dbSlowQueryThresholdMs: 250
+  maxIngestBytes: 262144
+  apiRateLimitEnabled: true
+  apiRateLimitRequirePersistent: true
+  apiRateLimitRequests: 240
+  apiRateLimitWindowSeconds: 60
+  mqttEnabled: false
+  mqttRequireAuth: false
+  mqttRequireTls: false
+  migrationMode: verify
+  dbWaitTimeoutSeconds: 120
+  authStrategy: shared_secret
+  authExpectedAudience: shakti-intelligence-fusion
+  authJwksUrl: ""
+  authJwtIssuer: ""
+  authJwtAudience: shakti-intelligence-fusion
+  authJwtAlgorithms: RS256
+  authMaxSkewSeconds: 300
+  authReplayTtlSeconds: 900
+  authMaxClaimsBytes: 4096
+  authRequirePersistentReplayGuard: true
+  extra: {}
+
+migrationJob:
+  enabled: true
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 600
+
+postgres:
+  enabled: true
+  image:
+    repository: postgis/postgis
+    tag: 16-3.4
+    pullPolicy: IfNotPresent
+  service:
+    port: 5432
+  auth:
+    username: shakti
+    database: shakti
+    password: replace-me
+    existingSecret: ""
+    passwordKey: postgres-password
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi

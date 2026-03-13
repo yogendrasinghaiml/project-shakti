@@ -105,6 +105,16 @@ Run the phase-4 load harness:
 
 Targets and gate thresholds are documented in `docs/load_testing_and_slos.md`.
 
+## Frontend Path Smoke
+
+Validate the API paths consumed by the React dashboard:
+
+```bash
+.venv/bin/python ops/smoke/frontend_path_smoke.py \
+  --base-url http://127.0.0.1:18080 \
+  --shared-secret <auth-shared-secret>
+```
+
 ## Staging
 
 Use the staging override plus the published GHCR image:
@@ -120,6 +130,20 @@ docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.s
 ```
 
 This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. Alert rules are defined in `ops/staging/prometheus/alerts.yml`. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`, including file-backed credentials for PostgreSQL, exporter, and Grafana.
+
+## Kubernetes
+
+Deploy with Helm:
+
+```bash
+helm template shakti-staging deploy/helm/shakti -f deploy/helm/shakti/values-staging.yaml
+helm upgrade --install shakti-staging deploy/helm/shakti \
+  -n shakti-staging --create-namespace \
+  -f deploy/helm/shakti/values-staging.yaml
+```
+
+Production should pin immutable image digests using `values-production.yaml` overrides.
+Detailed rollout and rollback guidance is documented in `docs/kubernetes_deployment_and_rollout.md`.
 
 ## Production Plan
 

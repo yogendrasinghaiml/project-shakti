@@ -362,3 +362,56 @@ def test_live_api_uses_persistent_postgres_rate_limiter():
         )
         assert first.status_code == 200
         assert second.status_code == 429
+
+
+def test_live_api_recent_observations_endpoint_returns_api_backed_events():
+    actor_user_id = str(uuid4())
+    _run_async(_seed_user(actor_user_id, ClearanceLevel.TOP_SECRET))
+
+    app = create_app(
+        settings=Settings(
+            pg_dsn=TEST_PG_DSN,
+            auth_shared_secret_primary=TEST_AUTH_SECRET,
+            auth_require_persistent_replay_guard=True,
+            auth_expected_audience="shakti-intelligence-fusion",
+            max_ingest_bytes=65536,
+        ),
+        repository=None,
+        enable_mqtt=False,
+    )
+
+    with TestClient(app) as client:
+        headers = build_auth_claim_headers(
+            user_id=actor_user_id,
+            clearance=ClearanceLevel.TOP_SECRET,
+            shared_secret=TEST_AUTH_SECRET,
+        )
+
+        ingest = client.post(
+            "/v1/ingest/hook",
+            headers=headers,
+            json={
+                "target_id": "LIVE-OBS-TARGET-1",
+                "source_id": "SRC-OBS-A",
+                "source_type": "REST_HOOK",
+                "observed_at": "2026-03-02T00:05:00Z",
+                "classification_marking": "SECRET",
+                "confidence": 0.88,
+                "coordinate": {"lat": 28.6139, "lon": 77.2090},
+                "unit_type": "HOSTILE",
+                "payload": {"sensor": "obs-a"},
+            },
+        )
+        assert ingest.status_code == 200
+
+        recent = client.get(
+            "/v1/observations/recent?limit=20",
+            headers=build_auth_claim_headers(
+                user_id=actor_user_id,
+                clearance=ClearanceLevel.TOP_SECRET,
+                shared_secret=TEST_AUTH_SECRET,
+            ),
+        )
+        assert recent.status_code == 200
+        items = recent.json()
+        assert any(item["target_id"] == "LIVE-OBS-TARGET-1" for item in items)

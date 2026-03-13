@@ -32,18 +32,18 @@ This checklist tracks the remaining work to move SHAKTI from staging-grade to pr
 
 ## Phase 5: Real Deployment Targets
 
-- [ ] Add Kubernetes manifests or a Helm chart
-- [ ] Add environment overlays for staging and production
-- [ ] Add image/tag pinning and rollout strategy docs
+- [x] Add Kubernetes manifests or a Helm chart
+- [x] Add environment overlays for staging and production
+- [x] Add image/tag pinning and rollout strategy docs
 
 ## Phase 6: External Auth Hardening
 
-- [ ] Add JWT/JWKS validation for real external identity providers
-- [ ] Separate gateway signing concerns from service-side validation
-- [ ] Add key rotation and issuer/audience policy tests
+- [x] Add JWT/JWKS validation for real external identity providers
+- [x] Separate gateway signing concerns from service-side validation
+- [x] Add key rotation and issuer/audience policy tests
 
 ## Phase 7: Frontend Product Hardening
 
-- [ ] Add production navigation, error states, and loading states
-- [ ] Add frontend smoke tests for the main user paths
-- [ ] Replace demo-only surfaces with real API-backed flows
+- [x] Add production navigation, error states, and loading states
+- [x] Add frontend smoke tests for the main user paths
+- [x] Replace demo-only surfaces with real API-backed flows

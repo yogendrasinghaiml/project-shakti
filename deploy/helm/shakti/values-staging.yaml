@@ -1,0 +1,42 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/your-ghcr-owner/project-shakti-api
+  tag: sha-REPLACE_WITH_RELEASE_SHA
+  digest: ""
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 768Mi
+
+env:
+  migrationMode: verify
+  authStrategy: shared_secret
+  authExpectedAudience: shakti-intelligence-fusion
+  mqttEnabled: false
+  apiRateLimitEnabled: true
+  apiRateLimitRequirePersistent: true
+
+secretMounts:
+  auth:
+    create: false
+    existingSecret: shakti-staging-auth
+  db:
+    create: true
+    existingSecret: ""
+    dsn: ""
+
+migrationJob:
+  enabled: true
+
+postgres:
+  enabled: true
+  auth:
+    username: shakti
+    database: shakti
+    password: replace-with-staging-password

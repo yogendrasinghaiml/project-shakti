@@ -17,6 +17,7 @@ from backend.intelligence_fusion_service import (
     AUTH_CLAIMS_HEADER,
     AUTH_DEFAULT_AUDIENCE,
     AUTH_SIGNATURE_HEADER,
+    AUTH_TOKEN_HEADER,
     ClearanceLevel,
     ConflictOut,
     InMemoryReplayGuard,
@@ -24,6 +25,7 @@ from backend.intelligence_fusion_service import (
     IngestResult,
     JsonLogFormatter,
     PostgresFusionRepository,
+    RecentObservationOut,
     Settings,
     build_auth_claim_headers,
     create_app,
@@ -40,6 +42,7 @@ class FakeRepository:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.conflicts: list[ConflictOut] = []
+        self.observations: list[RecentObservationOut] = []
         self.last_conflict_clearance: ClearanceLevel | None = None
 
     async def ingest_observation(self, observation, actor_user_id, actor_clearance):
@@ -65,6 +68,15 @@ class FakeRepository:
         self.last_conflict_clearance = actor_clearance
         return self.conflicts[:limit]
 
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ):
+        self.last_conflict_clearance = actor_clearance
+        return self.observations[:limit]
+
 
 class DenyRepository:
     async def ingest_observation(self, observation, actor_user_id, actor_clearance):
@@ -75,6 +87,14 @@ class DenyRepository:
         actor_user_id: str,
         actor_clearance: ClearanceLevel,
         limit: int = 100,
+    ):
+        raise PermissionError("Authenticated actor is inactive.")
+
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
     ):
         raise PermissionError("Authenticated actor is inactive.")
 
@@ -119,6 +139,15 @@ def make_auth_headers(
         jti=jti,
         audience=audience,
     )
+
+
+def enable_jwt_runtime_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyJwkClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr("backend.intelligence_fusion_service.jwt", object())
+    monkeypatch.setattr("backend.intelligence_fusion_service.PyJWKClient", DummyJwkClient)
 
 
 def make_request(app, path: str, method: str = "GET") -> Request:
@@ -302,6 +331,57 @@ def test_pending_conflicts_endpoint():
         assert repo.last_conflict_clearance == ClearanceLevel.SECRET
 
 
+def test_recent_observations_endpoint():
+    repo = FakeRepository()
+    repo.observations = [
+        RecentObservationOut(
+            observation_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            target_id="TARGET-99",
+            source_id="SRC-A",
+            source_type="REST_HOOK",
+            classification_marking=ClearanceLevel.SECRET,
+            observed_at=datetime.now(timezone.utc),
+            lat=28.6139,
+            lon=77.2090,
+            unit_type="HOSTILE",
+        )
+    ]
+
+    app = create_app(settings=make_settings(), repository=repo, enable_mqtt=False)
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/observations/recent?limit=10",
+            headers=make_auth_headers(clearance=ClearanceLevel.SECRET),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        assert body[0]["target_id"] == "TARGET-99"
+        assert body[0]["source_id"] == "SRC-A"
+        assert body[0]["unit_type"] == "HOSTILE"
+
+
+def test_recent_observations_returns_403_when_repository_denies_actor():
+    app = create_app(settings=make_settings(), repository=DenyRepository(), enable_mqtt=False)
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/observations/recent?limit=10",
+            headers=make_auth_headers(clearance=ClearanceLevel.TOP_SECRET),
+        )
+        assert response.status_code == 403
+        assert "inactive" in response.json()["detail"].lower()
+
+
+def test_recent_observations_rejects_missing_actor_identity_state():
+    app = create_app(settings=make_settings(), repository=FakeRepository(), enable_mqtt=False)
+    request = make_request(app, "/v1/observations/recent")
+    request.state.user_clearance = ClearanceLevel.TOP_SECRET
+    endpoint = get_route_endpoint(app, "/v1/observations/recent")
+
+    with pytest.raises(HTTPException, match="Missing validated actor identity"):
+        asyncio.run(endpoint(request, limit=10))
+
+
 def test_pending_conflicts_returns_403_when_repository_denies_actor():
     app = create_app(settings=make_settings(), repository=DenyRepository(), enable_mqtt=False)
     with TestClient(app) as client:
@@ -329,6 +409,173 @@ def test_pending_conflicts_requires_authenticated_claims():
         response = client.get("/v1/conflicts/pending?limit=10")
         assert response.status_code == 401
         assert AUTH_CLAIMS_HEADER in response.json()["detail"]
+
+
+def test_jwt_jwks_strategy_accepts_bearer_token(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "jwt-token"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer jwt-token"},
+        )
+        assert response.status_code == 200
+
+
+def test_jwt_jwks_strategy_accepts_x_auth_token_header(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "jwt-token-via-custom-header"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={AUTH_TOKEN_HEADER: "jwt-token-via-custom-header"},
+        )
+        assert response.status_code == 200
+
+
+def test_jwt_jwks_strategy_key_rotation_accepts_old_and_new_tokens(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        token_map = {
+            "old-key-token": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "new-key-token": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        }
+        if token not in token_map:
+            raise ValueError("Invalid bearer token.")
+        return actor_user_id, ClearanceLevel.TOP_SECRET, token_map[token]
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        old_key_response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer old-key-token"},
+        )
+        new_key_response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer new-key-token"},
+        )
+        assert old_key_response.status_code == 200
+        assert new_key_response.status_code == 200
+
+
+def test_jwt_jwks_strategy_rejects_missing_token_headers(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get("/v1/conflicts/pending?limit=10")
+        assert response.status_code == 400
+        assert "bearer token" in response.json()["detail"].lower()
+
+
+def test_jwt_jwks_strategy_allows_bearer_token_reuse_without_replay_rejection(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "stable-jwt-token"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        first = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer stable-jwt-token"},
+        )
+        second = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer stable-jwt-token"},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
 
 
 def test_rejects_tampered_auth_signature():
@@ -749,6 +996,35 @@ def test_settings_rejects_invalid_auth_replay_ttl_seconds():
 def test_settings_rejects_invalid_auth_max_claims_bytes():
     with pytest.raises(ValueError, match="AUTH_MAX_CLAIMS_BYTES must be at least 256 bytes"):
         Settings(auth_max_claims_bytes=255)
+
+
+def test_settings_rejects_invalid_auth_strategy():
+    with pytest.raises(ValueError, match="AUTH_STRATEGY must be either"):
+        Settings(auth_strategy="invalid-auth-strategy")
+
+
+def test_settings_rejects_jwt_jwks_strategy_without_jwks_url():
+    with pytest.raises(ValueError, match="AUTH_JWKS_URL must be set"):
+        Settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        )
+
+
+def test_settings_rejects_jwt_jwks_strategy_without_issuer():
+    with pytest.raises(ValueError, match="AUTH_JWT_ISSUER must be set"):
+        Settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        )
 
 
 def test_settings_rejects_invalid_api_rate_limit_requests():

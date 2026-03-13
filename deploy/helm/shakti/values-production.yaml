@@ -1,0 +1,42 @@
+replicaCount: 3
+
+image:
+  repository: ghcr.io/your-ghcr-owner/project-shakti-api
+  tag: vREPLACE_WITH_RELEASE_VERSION
+  digest: sha256:REPLACE_WITH_IMAGE_DIGEST
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1536Mi
+
+env:
+  migrationMode: verify
+  authStrategy: jwt_jwks
+  authExpectedAudience: shakti-intelligence-fusion
+  authJwksUrl: https://issuer.example/.well-known/jwks.json
+  authJwtIssuer: https://issuer.example/
+  authJwtAudience: shakti-intelligence-fusion
+  authJwtAlgorithms: RS256
+  authRequirePersistentReplayGuard: false
+  mqttEnabled: false
+  apiRateLimitEnabled: true
+  apiRateLimitRequirePersistent: true
+
+secretMounts:
+  auth:
+    create: false
+    existingSecret: shakti-production-auth
+  db:
+    create: false
+    existingSecret: shakti-production-db
+
+migrationJob:
+  enabled: true
+
+postgres:
+  enabled: false
