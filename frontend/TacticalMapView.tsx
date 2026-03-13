@@ -7,11 +7,11 @@ import {
   filterEventsByTimeRange,
   getUnitStyle,
   normalizeUnitType,
+  type UnitType,
 } from "./tactical_helpers";
 
 export { buildUnitIconSvg, filterEventsByTimeRange } from "./tactical_helpers";
-
-export type UnitType = "FRIENDLY" | "HOSTILE" | "UNKNOWN";
+export type { UnitType } from "./tactical_helpers";
 
 export interface TacticalIntelPoint {
   id: string;

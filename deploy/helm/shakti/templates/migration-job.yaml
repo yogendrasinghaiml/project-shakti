@@ -1,0 +1,44 @@
+{{- if .Values.migrationJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-migrate-%d" (include "shakti.fullname" .) .Release.Revision | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "shakti.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrationJob.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migrationJob.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "shakti.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "shakti.serviceAccountName" . }}
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "shakti.apiImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python
+            - /app/ops/db/migrate.py
+            - --dsn-file
+            - /run/secrets/db/{{ .Values.secretMounts.db.key }}
+            - up
+          volumeMounts:
+            - name: db-secret
+              mountPath: /run/secrets/db
+              readOnly: true
+      volumes:
+        - name: db-secret
+          secret:
+            secretName: {{ include "shakti.dbSecretName" . }}
+{{- end }}

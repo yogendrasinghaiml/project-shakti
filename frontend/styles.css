@@ -1,0 +1,237 @@
+:root {
+  color-scheme: dark;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(18, 71, 98, 0.9) 0%, rgba(8, 16, 24, 0.98) 48%),
+    linear-gradient(180deg, #07111a 0%, #04070b 100%);
+  color: #edf4f7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background:
+    linear-gradient(90deg, rgba(41, 102, 134, 0.14) 1px, transparent 1px),
+    linear-gradient(rgba(41, 102, 134, 0.14) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: radial-gradient(circle at center, black, transparent 82%);
+  pointer-events: none;
+}
+
+.app-shell {
+  position: relative;
+  display: grid;
+  gap: 24px;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+.hero-panel,
+.map-panel {
+  position: relative;
+  border: 1px solid rgba(112, 182, 214, 0.2);
+  background: linear-gradient(180deg, rgba(10, 18, 28, 0.96), rgba(6, 12, 18, 0.96));
+  box-shadow: 0 18px 80px rgba(0, 0, 0, 0.28);
+}
+
+.hero-panel {
+  display: grid;
+  gap: 24px;
+  padding: 28px;
+}
+
+.hero-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.refresh-button {
+  border: 1px solid rgba(120, 194, 222, 0.35);
+  background: rgba(8, 24, 36, 0.9);
+  color: #c9e9f7;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.refresh-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.eyebrow {
+  display: inline-block;
+  margin-bottom: 12px;
+  padding: 6px 10px;
+  border: 1px solid rgba(102, 209, 255, 0.35);
+  color: #73d9ff;
+  font-size: 0.78rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.hero-panel h1 {
+  margin: 0;
+  font-family: "Avenir Next Condensed", "Franklin Gothic Medium", sans-serif;
+  font-size: clamp(2.4rem, 5vw, 4.6rem);
+  line-height: 0.95;
+  text-transform: uppercase;
+}
+
+.hero-copy {
+  max-width: 62ch;
+  color: #a9c1cf;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.status-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.status-card {
+  padding: 14px 16px;
+  border: 1px solid rgba(132, 193, 222, 0.18);
+  background: rgba(10, 24, 36, 0.68);
+}
+
+.status-card span {
+  display: block;
+  margin-bottom: 8px;
+  color: #7ca7bb;
+  font-size: 0.74rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.status-card strong {
+  font-size: 1rem;
+  color: #edf4f7;
+}
+
+.status-card small {
+  display: block;
+  margin-top: 8px;
+  color: #7ca7bb;
+  font-size: 0.72rem;
+}
+
+.nav-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nav-button {
+  border: 1px solid rgba(120, 194, 222, 0.22);
+  background: rgba(13, 28, 40, 0.82);
+  color: #b9d8e8;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.nav-button-active {
+  border-color: rgba(115, 217, 255, 0.7);
+  color: #e7f7ff;
+  background: rgba(20, 50, 66, 0.85);
+}
+
+.panel {
+  position: relative;
+  border: 1px solid rgba(112, 182, 214, 0.2);
+  background: linear-gradient(180deg, rgba(10, 18, 28, 0.96), rgba(6, 12, 18, 0.96));
+  box-shadow: 0 18px 80px rgba(0, 0, 0, 0.28);
+  padding: 18px;
+}
+
+.loading-panel {
+  color: #bad8e6;
+}
+
+.error-panel {
+  border-color: rgba(255, 116, 116, 0.35);
+  color: #ffd1d1;
+}
+
+.overview-panel h2,
+.conflicts-panel h2 {
+  margin-top: 0;
+}
+
+.empty-state {
+  color: #b9d0dc;
+}
+
+.conflict-list {
+  display: grid;
+  gap: 12px;
+}
+
+.conflict-item {
+  border: 1px solid rgba(132, 193, 222, 0.18);
+  background: rgba(10, 24, 36, 0.68);
+  padding: 12px;
+}
+
+.conflict-item p {
+  margin: 10px 0;
+  color: #d3e3ec;
+}
+
+.conflict-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.conflict-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: #8fb2c5;
+  font-size: 0.82rem;
+}
+
+.map-panel {
+  padding: 16px;
+}
+
+.leaflet-container {
+  background: #0a1118;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 20px 12px 28px;
+  }
+
+  .hero-panel,
+  .map-panel {
+    padding: 14px;
+  }
+}

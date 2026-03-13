@@ -1,0 +1,70 @@
+groups:
+  - name: shakti-api-alerts
+    rules:
+      - alert: ShaktiApiHigh5xxRate
+        expr: |
+          (
+            sum(rate(shakti_http_requests_total{job="shakti-api",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(shakti_http_requests_total{job="shakti-api"}[5m])), 0.001)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: shakti-api
+        annotations:
+          summary: SHAKTI API has elevated 5xx responses.
+          description: 5xx rate has been above 5% for 10 minutes.
+
+      - alert: ShaktiApiHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(
+                shakti_http_request_duration_seconds_bucket{
+                  job="shakti-api",
+                  path!~"/healthz|/metrics"
+                }[5m]
+              )
+            )
+          ) > 0.75
+        for: 10m
+        labels:
+          severity: warning
+          service: shakti-api
+        annotations:
+          summary: SHAKTI API p95 latency is elevated.
+          description: p95 latency has stayed above 750ms for 10 minutes.
+
+  - name: shakti-database-alerts
+    rules:
+      - alert: ShaktiDbExporterDown
+        expr: up{job="shakti-postgres-exporter"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: shakti-postgres-exporter
+        annotations:
+          summary: PostgreSQL exporter is down.
+          description: Prometheus cannot scrape postgres-exporter for 2 minutes.
+
+      - alert: ShaktiDatabaseDown
+        expr: pg_up{job="shakti-postgres-exporter"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: shakti-postgres
+        annotations:
+          summary: PostgreSQL is reported down by exporter.
+          description: pg_up is 0 for 2 minutes.
+
+      - alert: ShaktiDbOperationErrors
+        expr: sum(rate(shakti_db_operations_total{job="shakti-api",status="error"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: shakti-api
+        annotations:
+          summary: SHAKTI DB operation errors are elevated.
+          description: Database operation error rate has exceeded 0.1 errors/sec for 10 minutes.

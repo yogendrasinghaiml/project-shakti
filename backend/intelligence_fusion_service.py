@@ -17,12 +17,25 @@ from enum import Enum
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+
+try:
+    import jwt
+    from jwt import InvalidTokenError, PyJWKClient
+except Exception:  # pragma: no cover - optional dependency in constrained environments
+    jwt = None
+
+    class InvalidTokenError(Exception):  # type: ignore[no-redef]
+        pass
+
+    PyJWKClient = None
 
 try:
     from asyncio_mqtt import Client as MQTTClient
@@ -37,7 +50,137 @@ MqttError = AsyncIOMqttError
 
 
 logger = logging.getLogger("shakti.intelligence_fusion")
-logging.basicConfig(level=logging.INFO)
+_LOG_RECORD_RESERVED_KEYS = frozenset(logging.makeLogRecord({}).__dict__.keys())
+_LOG_LEVEL_NAMES = frozenset(logging.getLevelNamesMapping().keys())
+_LOGGING_STATE: tuple[str, bool] | None = None
+_DB_SLOW_QUERY_THRESHOLD_MS = float(os.getenv("DB_SLOW_QUERY_THRESHOLD_MS", "250"))
+
+HTTP_REQUESTS_TOTAL = Counter(
+    "shakti_http_requests_total",
+    "Total HTTP requests handled by the SHAKTI API.",
+    ("method", "path", "status"),
+)
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "shakti_http_request_duration_seconds",
+    "HTTP request duration in seconds.",
+    ("method", "path"),
+)
+HTTP_REQUESTS_IN_PROGRESS = Gauge(
+    "shakti_http_requests_in_progress",
+    "Current in-flight HTTP requests.",
+    ("method", "path"),
+)
+DB_OPERATIONS_TOTAL = Counter(
+    "shakti_db_operations_total",
+    "Total tracked PostgreSQL operations.",
+    ("operation", "status"),
+)
+DB_OPERATION_DURATION_SECONDS = Histogram(
+    "shakti_db_operation_duration_seconds",
+    "Tracked PostgreSQL operation duration in seconds.",
+    ("operation", "status"),
+)
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        extra_fields = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _LOG_RECORD_RESERVED_KEYS and not key.startswith("_")
+        }
+        if extra_fields:
+            payload.update(extra_fields)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=_json_default, separators=(",", ":"))
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, UUID):
+        return str(value)
+    return str(value)
+
+
+def configure_logging(log_level: str, json_logs: bool) -> None:
+    global _LOGGING_STATE
+
+    normalized_level = log_level.upper()
+    desired_state = (normalized_level, json_logs)
+    if _LOGGING_STATE == desired_state:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter() if json_logs else logging.Formatter("%(message)s"))
+    logging.basicConfig(level=normalized_level, handlers=[handler], force=True)
+    _LOGGING_STATE = desired_state
+
+
+def log_event(level: int, message: str, **fields: Any) -> None:
+    logger.log(level, message, extra=fields)
+
+
+def redact_dsn(dsn: str) -> str:
+    parts = urlsplit(dsn)
+    if not parts.scheme or parts.hostname is None:
+        return dsn
+    auth_prefix = ""
+    if parts.username:
+        auth_prefix = f"{parts.username}:***@"
+    host = parts.hostname
+    port = f":{parts.port}" if parts.port is not None else ""
+    return urlunsplit(
+        (
+            parts.scheme,
+            f"{auth_prefix}{host}{port}",
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
+
+
+async def _track_db_operation(
+    operation: str,
+    func,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    started_at = time.perf_counter()
+    status = "success"
+    try:
+        return await func(*args, **kwargs)
+    except Exception as exc:
+        status = "error"
+        log_event(
+            logging.ERROR,
+            "db_operation_failed",
+            operation=operation,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            error_type=type(exc).__name__,
+        )
+        raise
+    finally:
+        duration_s = time.perf_counter() - started_at
+        DB_OPERATIONS_TOTAL.labels(operation, status).inc()
+        DB_OPERATION_DURATION_SECONDS.labels(operation, status).observe(duration_s)
+        if status == "success" and duration_s * 1000 >= _DB_SLOW_QUERY_THRESHOLD_MS:
+            log_event(
+                logging.WARNING,
+                "db_operation_slow",
+                operation=operation,
+                duration_ms=round(duration_s * 1000, 3),
+            )
 
 
 class ClearanceLevel(str, Enum):
@@ -61,6 +204,8 @@ CLEARANCE_RANK: dict[ClearanceLevel, int] = {
 SYSTEM_ACTOR_UUID = "00000000-0000-0000-0000-000000000000"
 AUTH_CLAIMS_HEADER = "X-Auth-Claims"
 AUTH_SIGNATURE_HEADER = "X-Auth-Signature"
+AUTH_BEARER_HEADER = "Authorization"
+AUTH_TOKEN_HEADER = "X-Auth-Token"
 AUTH_DEFAULT_AUDIENCE = "shakti-intelligence-fusion"
 
 
@@ -202,6 +347,78 @@ def verify_auth_claims(
     return actor_user_id, user_clearance, jti
 
 
+def extract_bearer_token(headers: Any) -> str:
+    authorization = str(headers.get(AUTH_BEARER_HEADER, "")).strip()
+    if authorization:
+        prefix, _, token = authorization.partition(" ")
+        if prefix.lower() == "bearer" and token.strip():
+            return token.strip()
+
+    raw_token = str(headers.get(AUTH_TOKEN_HEADER, "")).strip()
+    if raw_token:
+        return raw_token
+    raise ValueError(
+        f"Missing bearer token. Provide {AUTH_BEARER_HEADER}: Bearer <token> "
+        f"or {AUTH_TOKEN_HEADER}."
+    )
+
+
+class JwtJwksAuthValidator:
+    def __init__(
+        self,
+        *,
+        jwks_url: str,
+        issuer: str,
+        audience: str,
+        algorithms: tuple[str, ...],
+        max_skew_seconds: int,
+    ) -> None:
+        if jwt is None or PyJWKClient is None:
+            raise RuntimeError("JWT/JWKS auth strategy requires pyjwt[crypto] at runtime.")
+        self.jwks_url = jwks_url
+        self.issuer = issuer
+        self.audience = audience
+        self.algorithms = algorithms
+        self.max_skew_seconds = max_skew_seconds
+        self._jwk_client = PyJWKClient(jwks_url)
+
+    def verify_token(self, token: str) -> tuple[str, ClearanceLevel, str]:
+        try:
+            signing_key = self._jwk_client.get_signing_key_from_jwt(token)
+            claims = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=list(self.algorithms),
+                audience=self.audience,
+                issuer=self.issuer,
+                leeway=self.max_skew_seconds,
+                options={"require": ["iss", "aud", "iat", "jti"]},
+            )
+        except InvalidTokenError as exc:
+            raise ValueError("Invalid bearer token.") from exc
+        except Exception as exc:  # pragma: no cover - network/JWKS fetch errors
+            raise ValueError("Failed to validate bearer token with JWKS.") from exc
+
+        if not isinstance(claims, dict):
+            raise ValueError("Invalid bearer token payload.")
+
+        subject_raw = claims.get("sub", claims.get("user_id"))
+        if subject_raw is None:
+            raise ValueError("Bearer token is missing subject.")
+        actor_user_id = normalize_actor_user_id(str(subject_raw))
+
+        clearance_raw = claims.get("clearance")
+        if clearance_raw is None:
+            raise ValueError("Bearer token is missing clearance claim.")
+        user_clearance = ClearanceLevel(str(clearance_raw))
+        try:
+            jti = str(UUID(str(claims["jti"])))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("Bearer token jti must be a UUID.") from exc
+
+        return actor_user_id, user_clearance, jti
+
+
 class ReplayGuard(Protocol):
     async def mark_jti_seen(self, jti: str) -> bool:
         ...
@@ -273,7 +490,9 @@ class PostgresRateLimiter:
 
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            await _track_db_operation(
+                "rate_limiter.ensure_schema.create_table",
+                conn.execute,
                 """
                 CREATE TABLE IF NOT EXISTS api_rate_limit_guard (
                   principal_key TEXT NOT NULL,
@@ -282,13 +501,15 @@ class PostgresRateLimiter:
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   PRIMARY KEY (principal_key, window_start)
                 )
-                """
+                """,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "rate_limiter.ensure_schema.create_index",
+                conn.execute,
                 """
                 CREATE INDEX IF NOT EXISTS idx_api_rate_limit_guard_window_start
                 ON api_rate_limit_guard (window_start)
-                """
+                """,
             )
 
     async def allow(self, key: str) -> bool:
@@ -299,11 +520,15 @@ class PostgresRateLimiter:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
+                await _track_db_operation(
+                    "rate_limiter.delete_expired",
+                    conn.execute,
                     "DELETE FROM api_rate_limit_guard WHERE window_start < $1",
                     expire_before,
                 )
-                row = await conn.fetchrow(
+                row = await _track_db_operation(
+                    "rate_limiter.fetch_window",
+                    conn.fetchrow,
                     """
                     SELECT request_count
                     FROM api_rate_limit_guard
@@ -315,7 +540,9 @@ class PostgresRateLimiter:
                     window_start,
                 )
                 if row is None:
-                    await conn.execute(
+                    await _track_db_operation(
+                        "rate_limiter.insert_window",
+                        conn.execute,
                         """
                         INSERT INTO api_rate_limit_guard (
                           principal_key,
@@ -333,7 +560,9 @@ class PostgresRateLimiter:
                 if request_count >= self.max_requests:
                     return False
 
-                await conn.execute(
+                await _track_db_operation(
+                    "rate_limiter.update_window",
+                    conn.execute,
                     """
                     UPDATE api_rate_limit_guard
                     SET request_count = request_count + 1,
@@ -357,29 +586,37 @@ class PostgresReplayGuard:
 
     async def ensure_schema(self) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute(
+            await _track_db_operation(
+                "replay_guard.ensure_schema.create_table",
+                conn.execute,
                 """
                 CREATE TABLE IF NOT EXISTS auth_claim_replay_guard (
                   jti UUID PRIMARY KEY,
                   expires_at TIMESTAMPTZ NOT NULL,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                """
+                """,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "replay_guard.ensure_schema.create_index",
+                conn.execute,
                 """
                 CREATE INDEX IF NOT EXISTS idx_auth_claim_replay_guard_expires_at
                 ON auth_claim_replay_guard (expires_at)
-                """
+                """,
             )
 
     async def mark_jti_seen(self, jti: str) -> bool:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
+                await _track_db_operation(
+                    "replay_guard.delete_expired",
+                    conn.execute,
                     "DELETE FROM auth_claim_replay_guard WHERE expires_at <= NOW()"
                 )
-                inserted = await conn.fetchval(
+                inserted = await _track_db_operation(
+                    "replay_guard.insert_jti",
+                    conn.fetchval,
                     """
                     INSERT INTO auth_claim_replay_guard (jti, expires_at)
                     VALUES ($1::uuid, $2)
@@ -410,6 +647,44 @@ def load_shared_secrets_from_file(path: str) -> tuple[str, str]:
     primary = str(primary_raw).strip() if primary_raw is not None else ""
     secondary = str(secondary_raw).strip() if secondary_raw is not None else ""
     return primary, secondary
+
+
+def load_text_value(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip()
+
+
+def load_text_value_from_env_or_file(name: str, default: str = "") -> str:
+    raw_value = os.getenv(name)
+    raw_file = os.getenv(f"{name}_FILE")
+    value = raw_value.strip() if raw_value is not None else ""
+    file_path = raw_file.strip() if raw_file is not None else ""
+
+    if value and file_path:
+        raise ValueError(f"{name} and {name}_FILE cannot both be set.")
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"{name}_FILE is unreadable: {file_path}") from exc
+    if raw_value is None:
+        return default
+    return value
+
+
+def load_bool_value(name: str, default: bool) -> bool:
+    default_raw = "true" if default else "false"
+    return load_text_value(name, default_raw).lower() in {"1", "true", "yes", "on"}
+
+
+def load_int_value(name: str, default: int) -> int:
+    return int(load_text_value(name, str(default)))
+
+
+def load_float_value(name: str, default: float) -> float:
+    return float(load_text_value(name, str(default)))
 
 
 class Coordinate(BaseModel):
@@ -453,69 +728,127 @@ class ConflictOut(BaseModel):
     created_at: datetime
 
 
+class RecentObservationOut(BaseModel):
+    observation_id: UUID
+    target_id: str
+    source_id: str
+    source_type: SourceType
+    classification_marking: ClearanceLevel
+    observed_at: datetime
+    lat: float
+    lon: float
+    unit_type: str
+
+
 @dataclass
 class Settings:
-    pg_dsn: str = os.getenv(
-        "PG_DSN",
-        "postgresql://shakti:shakti@127.0.0.1:5432/shakti",
+    pg_dsn: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file(
+            "PG_DSN",
+            "postgresql://shakti:shakti@127.0.0.1:5432/shakti",
+        )
     )
-    mqtt_host: str = os.getenv("MQTT_HOST", "127.0.0.1")
-    mqtt_port: int = int(os.getenv("MQTT_PORT", "1883"))
-    mqtt_topic: str = os.getenv("MQTT_TOPIC", "shakti/intel/#")
-    mqtt_username: str = os.getenv("MQTT_USERNAME", "")
-    mqtt_password: str = os.getenv("MQTT_PASSWORD", "")
-    mqtt_require_auth: bool = (
-        os.getenv("MQTT_REQUIRE_AUTH", "true").strip().lower() in {"1", "true", "yes", "on"}
+    log_level: str = field(default_factory=lambda: load_text_value("LOG_LEVEL", "INFO").upper())
+    log_json: bool = field(default_factory=lambda: load_bool_value("LOG_JSON", True))
+    db_slow_query_threshold_ms: float = field(
+        default_factory=lambda: load_float_value("DB_SLOW_QUERY_THRESHOLD_MS", 250)
     )
-    mqtt_tls_enabled: bool = (
-        os.getenv("MQTT_TLS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_enabled: bool = field(default_factory=lambda: load_bool_value("MQTT_ENABLED", True))
+    mqtt_host: str = field(default_factory=lambda: load_text_value("MQTT_HOST", "127.0.0.1"))
+    mqtt_port: int = field(default_factory=lambda: load_int_value("MQTT_PORT", 1883))
+    mqtt_topic: str = field(default_factory=lambda: load_text_value("MQTT_TOPIC", "shakti/intel/#"))
+    mqtt_username: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("MQTT_USERNAME", "")
     )
-    mqtt_require_tls: bool = (
-        os.getenv("MQTT_REQUIRE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_password: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("MQTT_PASSWORD", "")
     )
-    mqtt_tls_reload_check_seconds: int = int(
-        os.getenv("MQTT_TLS_RELOAD_CHECK_SECONDS", "15")
+    mqtt_require_auth: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_REQUIRE_AUTH", True)
     )
-    mqtt_tls_ca_file: str = os.getenv("MQTT_TLS_CA_FILE", "")
-    mqtt_tls_cert_file: str = os.getenv("MQTT_TLS_CERT_FILE", "")
-    mqtt_tls_key_file: str = os.getenv("MQTT_TLS_KEY_FILE", "")
-    conflict_threshold_m: float = float(os.getenv("CONFLICT_THRESHOLD_M", "250.0"))
-    max_ingest_bytes: int = int(os.getenv("MAX_INGEST_BYTES", "65536"))
-    api_rate_limit_enabled: bool = (
-        os.getenv("API_RATE_LIMIT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    mqtt_tls_enabled: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_TLS_ENABLED", True)
     )
-    api_rate_limit_require_persistent: bool = (
-        os.getenv("API_RATE_LIMIT_REQUIRE_PERSISTENT", "true").strip().lower()
-        in {"1", "true", "yes", "on"}
+    mqtt_require_tls: bool = field(
+        default_factory=lambda: load_bool_value("MQTT_REQUIRE_TLS", True)
     )
-    api_rate_limit_requests: int = int(os.getenv("API_RATE_LIMIT_REQUESTS", "120"))
-    api_rate_limit_window_seconds: int = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
-    mqtt_service_user_id: str = os.getenv(
-        "MQTT_SERVICE_USER_ID", "00000000-0000-0000-0000-000000000000"
+    mqtt_tls_reload_check_seconds: int = field(
+        default_factory=lambda: load_int_value("MQTT_TLS_RELOAD_CHECK_SECONDS", 15)
     )
-    mqtt_service_clearance: ClearanceLevel = ClearanceLevel(
-        os.getenv("MQTT_SERVICE_CLEARANCE", "TOP_SECRET")
+    mqtt_tls_ca_file: str = field(default_factory=lambda: load_text_value("MQTT_TLS_CA_FILE", ""))
+    mqtt_tls_cert_file: str = field(
+        default_factory=lambda: load_text_value("MQTT_TLS_CERT_FILE", "")
     )
-    auth_shared_secret_primary: str = os.getenv(
-        "AUTH_SHARED_SECRET_PRIMARY",
-        os.getenv("AUTH_SHARED_SECRET", ""),
+    mqtt_tls_key_file: str = field(default_factory=lambda: load_text_value("MQTT_TLS_KEY_FILE", ""))
+    conflict_threshold_m: float = field(
+        default_factory=lambda: load_float_value("CONFLICT_THRESHOLD_M", 250.0)
     )
-    auth_shared_secret_secondary: str = os.getenv("AUTH_SHARED_SECRET_SECONDARY", "")
-    auth_shared_secrets_file: str = os.getenv("AUTH_SHARED_SECRETS_FILE", "")
-    auth_expected_audience: str = os.getenv(
-        "AUTH_EXPECTED_AUDIENCE",
-        AUTH_DEFAULT_AUDIENCE,
+    max_ingest_bytes: int = field(default_factory=lambda: load_int_value("MAX_INGEST_BYTES", 65536))
+    api_rate_limit_enabled: bool = field(
+        default_factory=lambda: load_bool_value("API_RATE_LIMIT_ENABLED", True)
     )
-    auth_max_skew_seconds: int = int(os.getenv("AUTH_MAX_SKEW_SECONDS", "300"))
-    auth_replay_ttl_seconds: int = int(os.getenv("AUTH_REPLAY_TTL_SECONDS", "900"))
-    auth_max_claims_bytes: int = int(os.getenv("AUTH_MAX_CLAIMS_BYTES", "4096"))
-    auth_require_persistent_replay_guard: bool = (
-        os.getenv("AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD", "true").strip().lower()
-        in {"1", "true", "yes", "on"}
+    api_rate_limit_require_persistent: bool = field(
+        default_factory=lambda: load_bool_value("API_RATE_LIMIT_REQUIRE_PERSISTENT", True)
+    )
+    api_rate_limit_requests: int = field(
+        default_factory=lambda: load_int_value("API_RATE_LIMIT_REQUESTS", 120)
+    )
+    api_rate_limit_window_seconds: int = field(
+        default_factory=lambda: load_int_value("API_RATE_LIMIT_WINDOW_SECONDS", 60)
+    )
+    mqtt_service_user_id: str = field(
+        default_factory=lambda: load_text_value(
+            "MQTT_SERVICE_USER_ID",
+            "00000000-0000-0000-0000-000000000000",
+        )
+    )
+    mqtt_service_clearance: ClearanceLevel = field(
+        default_factory=lambda: ClearanceLevel(load_text_value("MQTT_SERVICE_CLEARANCE", "TOP_SECRET"))
+    )
+    auth_shared_secret_primary: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY", "")
+        or load_text_value_from_env_or_file("AUTH_SHARED_SECRET", "")
+    )
+    auth_shared_secret_secondary: str = field(
+        default_factory=lambda: load_text_value_from_env_or_file("AUTH_SHARED_SECRET_SECONDARY", "")
+    )
+    auth_shared_secrets_file: str = field(
+        default_factory=lambda: load_text_value("AUTH_SHARED_SECRETS_FILE", "")
+    )
+    auth_strategy: str = field(
+        default_factory=lambda: load_text_value("AUTH_STRATEGY", "shared_secret").lower()
+    )
+    auth_expected_audience: str = field(
+        default_factory=lambda: load_text_value("AUTH_EXPECTED_AUDIENCE", AUTH_DEFAULT_AUDIENCE)
+    )
+    auth_jwks_url: str = field(default_factory=lambda: load_text_value("AUTH_JWKS_URL", ""))
+    auth_jwt_issuer: str = field(default_factory=lambda: load_text_value("AUTH_JWT_ISSUER", ""))
+    auth_jwt_audience: str = field(
+        default_factory=lambda: load_text_value("AUTH_JWT_AUDIENCE", AUTH_DEFAULT_AUDIENCE)
+    )
+    auth_jwt_algorithms_raw: str = field(
+        default_factory=lambda: load_text_value("AUTH_JWT_ALGORITHMS", "RS256")
+    )
+    auth_jwt_algorithms: tuple[str, ...] = field(init=False, default=())
+    auth_max_skew_seconds: int = field(
+        default_factory=lambda: load_int_value("AUTH_MAX_SKEW_SECONDS", 300)
+    )
+    auth_replay_ttl_seconds: int = field(
+        default_factory=lambda: load_int_value("AUTH_REPLAY_TTL_SECONDS", 900)
+    )
+    auth_max_claims_bytes: int = field(
+        default_factory=lambda: load_int_value("AUTH_MAX_CLAIMS_BYTES", 4096)
+    )
+    auth_require_persistent_replay_guard: bool = field(
+        default_factory=lambda: load_bool_value("AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD", True)
     )
     auth_active_shared_secrets: tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
+        if self.log_level not in _LOG_LEVEL_NAMES:
+            raise ValueError("LOG_LEVEL must be a valid Python logging level.")
+        if self.db_slow_query_threshold_ms <= 0:
+            raise ValueError("DB_SLOW_QUERY_THRESHOLD_MS must be a positive number.")
         if self.max_ingest_bytes < 1:
             raise ValueError("MAX_INGEST_BYTES must be a positive integer.")
         if self.api_rate_limit_requests < 1:
@@ -530,8 +863,24 @@ class Settings:
             raise ValueError("AUTH_REPLAY_TTL_SECONDS must be a positive integer.")
         if self.auth_max_claims_bytes < 256:
             raise ValueError("AUTH_MAX_CLAIMS_BYTES must be at least 256 bytes.")
+        if self.auth_strategy not in {"shared_secret", "jwt_jwks"}:
+            raise ValueError("AUTH_STRATEGY must be either 'shared_secret' or 'jwt_jwks'.")
         if not self.auth_expected_audience.strip():
             raise ValueError("AUTH_EXPECTED_AUDIENCE must not be empty.")
+        if self.auth_strategy == "jwt_jwks":
+            if not self.auth_jwks_url.strip():
+                raise ValueError("AUTH_JWKS_URL must be set when AUTH_STRATEGY=jwt_jwks.")
+            if not self.auth_jwt_issuer.strip():
+                raise ValueError("AUTH_JWT_ISSUER must be set when AUTH_STRATEGY=jwt_jwks.")
+            if not self.auth_jwt_audience.strip():
+                raise ValueError("AUTH_JWT_AUDIENCE must be set when AUTH_STRATEGY=jwt_jwks.")
+
+        auth_jwt_algorithms = [
+            item.strip().upper() for item in self.auth_jwt_algorithms_raw.split(",") if item.strip()
+        ]
+        if self.auth_strategy == "jwt_jwks" and not auth_jwt_algorithms:
+            raise ValueError("AUTH_JWT_ALGORITHMS must define at least one algorithm.")
+        self.auth_jwt_algorithms = tuple(dict.fromkeys(auth_jwt_algorithms))
         if bool(self.mqtt_tls_cert_file.strip()) != bool(self.mqtt_tls_key_file.strip()):
             raise ValueError(
                 "MQTT_TLS_CERT_FILE and MQTT_TLS_KEY_FILE must be provided together."
@@ -573,6 +922,14 @@ class FusionRepository(Protocol):
     ) -> list[ConflictOut]:
         ...
 
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ) -> list[RecentObservationOut]:
+        ...
+
 
 class PostgresFusionRepository:
     def __init__(self, pool: asyncpg.Pool, conflict_threshold_m: float = 250.0) -> None:
@@ -586,7 +943,9 @@ class PostgresFusionRepository:
         actor_clearance: ClearanceLevel,
     ) -> str:
         actor_uuid = normalize_actor_user_id(actor_user_id)
-        actor_row = await conn.fetchrow(
+        actor_row = await _track_db_operation(
+            "fusion.validate_actor",
+            conn.fetchrow,
             """
             SELECT clearance_level, is_active
             FROM users
@@ -620,16 +979,22 @@ class PostgresFusionRepository:
                     actor_user_id=actor_user_id,
                     actor_clearance=actor_clearance,
                 )
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.set_clearance_context",
+                    conn.execute,
                     "SELECT set_config('app.user_clearance', $1, true)",
                     actor_clearance.value,
                 )
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.acquire_target_lock",
+                    conn.execute,
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     observation.target_id,
                 )
 
-                await conn.execute(
+                await _track_db_operation(
+                    "fusion.upsert_target",
+                    conn.execute,
                     """
                     INSERT INTO targets (target_id, unit_type, canonical_classification, metadata, last_modified_by)
                     VALUES ($1, $2, $3, '{}'::jsonb, $4)
@@ -648,7 +1013,9 @@ class PostgresFusionRepository:
                     actor_uuid,
                 )
 
-                previous = await conn.fetchrow(
+                previous = await _track_db_operation(
+                    "fusion.fetch_previous_observation",
+                    conn.fetchrow,
                     """
                     SELECT
                       observation_id,
@@ -666,7 +1033,9 @@ class PostgresFusionRepository:
                     observation.source_id,
                 )
 
-                observation_id = await conn.fetchval(
+                observation_id = await _track_db_operation(
+                    "fusion.insert_observation",
+                    conn.fetchval,
                     """
                     INSERT INTO intel_observations (
                       target_id,
@@ -730,7 +1099,9 @@ class PostgresFusionRepository:
                     observation.classification_marking,
                 )
 
-                conflict_id = await conn.fetchval(
+                conflict_id = await _track_db_operation(
+                    "fusion.insert_conflict",
+                    conn.fetchval,
                     """
                     INSERT INTO coordinate_conflicts (
                       target_id,
@@ -774,11 +1145,15 @@ class PostgresFusionRepository:
                 actor_user_id=actor_user_id,
                 actor_clearance=actor_clearance,
             )
-            await conn.execute(
+            await _track_db_operation(
+                "fusion.set_clearance_context",
+                conn.execute,
                 "SELECT set_config('app.user_clearance', $1, true)",
                 actor_clearance.value,
             )
-            rows = await conn.fetch(
+            rows = await _track_db_operation(
+                "fusion.fetch_pending_conflicts",
+                conn.fetch,
                 """
                 SELECT
                   conflict_id,
@@ -799,14 +1174,70 @@ class PostgresFusionRepository:
             )
             return [ConflictOut(**dict(row)) for row in rows]
 
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ) -> list[RecentObservationOut]:
+        safe_limit = max(1, min(limit, 500))
+        async with self.pool.acquire() as conn:
+            await self._validate_actor(
+                conn=conn,
+                actor_user_id=actor_user_id,
+                actor_clearance=actor_clearance,
+            )
+            await _track_db_operation(
+                "fusion.set_clearance_context",
+                conn.execute,
+                "SELECT set_config('app.user_clearance', $1, true)",
+                actor_clearance.value,
+            )
+            rows = await _track_db_operation(
+                "fusion.fetch_recent_observations",
+                conn.fetch,
+                """
+                SELECT
+                  io.observation_id,
+                  io.target_id,
+                  io.source_id,
+                  io.source_type,
+                  io.classification_marking,
+                  io.observed_at,
+                  ST_Y(io.location::geometry) AS lat,
+                  ST_X(io.location::geometry) AS lon,
+                  t.unit_type
+                FROM intel_observations io
+                JOIN targets t ON t.target_id = io.target_id
+                ORDER BY io.observed_at DESC
+                LIMIT $1
+                """,
+                safe_limit,
+            )
+            return [RecentObservationOut(**dict(row)) for row in rows]
+
 
 def create_app(
     settings: Settings | None = None,
     repository: FusionRepository | None = None,
-    enable_mqtt: bool = True,
+    enable_mqtt: bool | None = None,
     replay_guard: ReplayGuard | None = None,
 ) -> FastAPI:
+    global _DB_SLOW_QUERY_THRESHOLD_MS
+
     cfg = settings or Settings()
+    mqtt_enabled = cfg.mqtt_enabled if enable_mqtt is None else enable_mqtt
+    _DB_SLOW_QUERY_THRESHOLD_MS = cfg.db_slow_query_threshold_ms
+    configure_logging(cfg.log_level, cfg.log_json)
+    jwt_auth_validator: JwtJwksAuthValidator | None = None
+    if cfg.auth_strategy == "jwt_jwks":
+        jwt_auth_validator = JwtJwksAuthValidator(
+            jwks_url=cfg.auth_jwks_url,
+            issuer=cfg.auth_jwt_issuer,
+            audience=cfg.auth_jwt_audience,
+            algorithms=cfg.auth_jwt_algorithms,
+            max_skew_seconds=cfg.auth_max_skew_seconds,
+        )
 
     def build_mqtt_tls_context() -> ssl.SSLContext | None:
         if not cfg.mqtt_tls_enabled:
@@ -941,7 +1372,9 @@ def create_app(
         app.state.mqtt_task = None
 
         if app.state.repository is None:
-            pool = await asyncpg.create_pool(
+            pool = await _track_db_operation(
+                "pool.create",
+                asyncpg.create_pool,
                 dsn=cfg.pg_dsn,
                 min_size=2,
                 max_size=10,
@@ -952,9 +1385,15 @@ def create_app(
                 pool=pool,
                 conflict_threshold_m=cfg.conflict_threshold_m,
             )
-            logger.info("Connected to PostgreSQL for Intelligence Fusion service.")
+            log_event(
+                logging.INFO,
+                "postgres_connected",
+                pg_dsn=redact_dsn(cfg.pg_dsn),
+                pool_min_size=2,
+                pool_max_size=10,
+            )
 
-        if not cfg.auth_active_shared_secrets:
+        if cfg.auth_strategy == "shared_secret" and not cfg.auth_active_shared_secrets:
             raise RuntimeError(
                 "At least one authentication shared secret must be configured "
                 "(AUTH_SHARED_SECRET_PRIMARY or AUTH_SHARED_SECRET_SECONDARY)."
@@ -966,7 +1405,6 @@ def create_app(
                     max_requests=cfg.api_rate_limit_requests,
                     window_seconds=cfg.api_rate_limit_window_seconds,
                 )
-                await pg_rate_limiter.ensure_schema()
                 app.state.rate_limiter = pg_rate_limiter
             else:
                 if cfg.api_rate_limit_require_persistent:
@@ -980,7 +1418,7 @@ def create_app(
                     max_requests=cfg.api_rate_limit_requests,
                     window_seconds=cfg.api_rate_limit_window_seconds,
                 )
-        if enable_mqtt:
+        if mqtt_enabled:
             if cfg.mqtt_require_tls and not cfg.mqtt_tls_enabled:
                 raise RuntimeError(
                     "MQTT secure transport is required but MQTT_TLS_ENABLED is false."
@@ -992,35 +1430,35 @@ def create_app(
                     "MQTT authentication is required but MQTT_USERNAME/MQTT_PASSWORD are not configured."
                 )
 
-        if cfg.auth_require_persistent_replay_guard and isinstance(
-            app.state.replay_guard, InMemoryReplayGuard
-        ):
-            raise RuntimeError(
-                "Persistent replay guard is required; InMemoryReplayGuard is not allowed."
-            )
-
-        if app.state.replay_guard is None:
-            if app.state.pool is not None:
-                pg_replay_guard = PostgresReplayGuard(
-                    pool=app.state.pool,
-                    ttl_seconds=cfg.auth_replay_ttl_seconds,
+        if cfg.auth_strategy == "shared_secret":
+            if cfg.auth_require_persistent_replay_guard and isinstance(
+                app.state.replay_guard, InMemoryReplayGuard
+            ):
+                raise RuntimeError(
+                    "Persistent replay guard is required; InMemoryReplayGuard is not allowed."
                 )
-                await pg_replay_guard.ensure_schema()
-                app.state.replay_guard = pg_replay_guard
-            else:
-                if cfg.auth_require_persistent_replay_guard:
-                    raise RuntimeError(
-                        "Persistent replay guard is required but no PostgreSQL pool or "
-                        "external replay_guard is available."
+
+            if app.state.replay_guard is None:
+                if app.state.pool is not None:
+                    pg_replay_guard = PostgresReplayGuard(
+                        pool=app.state.pool,
+                        ttl_seconds=cfg.auth_replay_ttl_seconds,
                     )
-                logger.warning(
-                    "Using in-memory replay guard because no PostgreSQL pool is available."
-                )
-                app.state.replay_guard = InMemoryReplayGuard(
-                    ttl_seconds=cfg.auth_replay_ttl_seconds
-                )
+                    app.state.replay_guard = pg_replay_guard
+                else:
+                    if cfg.auth_require_persistent_replay_guard:
+                        raise RuntimeError(
+                            "Persistent replay guard is required but no PostgreSQL pool or "
+                            "external replay_guard is available."
+                        )
+                    logger.warning(
+                        "Using in-memory replay guard because no PostgreSQL pool is available."
+                    )
+                    app.state.replay_guard = InMemoryReplayGuard(
+                        ttl_seconds=cfg.auth_replay_ttl_seconds
+                    )
 
-        if enable_mqtt:
+        if mqtt_enabled:
             app.state.mqtt_task = asyncio.create_task(mqtt_ingest_worker(app))
 
         try:
@@ -1064,11 +1502,23 @@ def create_app(
     async def validate_gateway_identity(
         request: Request,
     ) -> tuple[str, ClearanceLevel, str] | JSONResponse:
-        if not cfg.auth_active_shared_secrets:
-            return auth_error_response(
-                status_code=503,
-                detail="No active authentication shared secrets are configured.",
-            )
+        if cfg.auth_strategy == "jwt_jwks":
+            if jwt_auth_validator is None:
+                return auth_error_response(
+                    status_code=503,
+                    detail="JWT/JWKS authentication validator is unavailable.",
+                )
+            try:
+                token = extract_bearer_token(request.headers)
+                return jwt_auth_validator.verify_token(token)
+            except ValueError as exc:
+                message = str(exc)
+                if message in {
+                    "Invalid bearer token.",
+                    "Failed to validate bearer token with JWKS.",
+                }:
+                    return auth_error_response(status_code=401, detail=message)
+                return auth_error_response(status_code=400, detail=message)
 
         claims_b64 = request.headers.get(AUTH_CLAIMS_HEADER)
         signature = request.headers.get(AUTH_SIGNATURE_HEADER)
@@ -1169,17 +1619,18 @@ def create_app(
                         status_code=429,
                         detail="Rate limit exceeded for API access.",
                     )
-            replay_guard_instance = app.state.replay_guard
-            if replay_guard_instance is None:
-                return auth_error_response(
-                    status_code=503,
-                    detail="Replay protection is unavailable.",
-                )
-            if not await replay_guard_instance.mark_jti_seen(jti):
-                return auth_error_response(
-                    status_code=401,
-                    detail="Authentication token replay detected.",
-                )
+            if cfg.auth_strategy == "shared_secret":
+                replay_guard_instance = app.state.replay_guard
+                if replay_guard_instance is None:
+                    return auth_error_response(
+                        status_code=503,
+                        detail="Replay protection is unavailable.",
+                    )
+                if not await replay_guard_instance.mark_jti_seen(jti):
+                    return auth_error_response(
+                        status_code=401,
+                        detail="Authentication token replay detected.",
+                    )
             request.state.actor_user_id = actor_user_id
             request.state.user_clearance = user_clearance
 
@@ -1226,9 +1677,61 @@ def create_app(
 
         return await call_next(request)
 
+    @app.middleware("http")
+    async def request_observability_middleware(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID", str(uuid4()))
+        request.state.request_id = request_id
+        request_path = request.url.path
+        request_method = request.method
+        request_started_at = time.perf_counter()
+        HTTP_REQUESTS_IN_PROGRESS.labels(request_method, request_path).inc()
+        response: Response | None = None
+        status_code = 500
+
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = request_id
+            return response
+        except Exception as exc:
+            log_event(
+                logging.ERROR,
+                "request_failed",
+                request_id=request_id,
+                method=request_method,
+                path=request_path,
+                status_code=status_code,
+                duration_ms=round((time.perf_counter() - request_started_at) * 1000, 3),
+                client_ip=request.client.host if request.client else None,
+                actor_user_id=getattr(request.state, "actor_user_id", None),
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            duration_s = time.perf_counter() - request_started_at
+            HTTP_REQUESTS_IN_PROGRESS.labels(request_method, request_path).dec()
+            HTTP_REQUESTS_TOTAL.labels(request_method, request_path, str(status_code)).inc()
+            HTTP_REQUEST_DURATION_SECONDS.labels(request_method, request_path).observe(duration_s)
+            if response is not None:
+                log_event(
+                    logging.WARNING if status_code >= 400 else logging.INFO,
+                    "request_completed",
+                    request_id=request_id,
+                    method=request_method,
+                    path=request_path,
+                    status_code=status_code,
+                    duration_ms=round(duration_s * 1000, 3),
+                    client_ip=request.client.host if request.client else None,
+                    actor_user_id=getattr(request.state, "actor_user_id", None),
+                )
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/v1/ingest/hook", response_model=IngestResult)
     async def ingest_hook(observation: IntelObservationIn, request: Request) -> IngestResult:
@@ -1269,6 +1772,29 @@ def create_app(
 
         try:
             return await app.state.repository.pending_conflicts_for_clearance(
+                actor_user_id=actor_user_id,
+                actor_clearance=user_clearance,
+                limit=limit,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.get("/v1/observations/recent", response_model=list[RecentObservationOut])
+    async def get_recent_observations(
+        request: Request, limit: int = 200
+    ) -> list[RecentObservationOut]:
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 500.")
+
+        user_clearance = getattr(request.state, "user_clearance", None)
+        if user_clearance is None:
+            raise HTTPException(status_code=401, detail="Missing validated user clearance.")
+        actor_user_id = getattr(request.state, "actor_user_id", None)
+        if actor_user_id is None:
+            raise HTTPException(status_code=401, detail="Missing validated actor identity.")
+
+        try:
+            return await app.state.repository.recent_observations_for_clearance(
                 actor_user_id=actor_user_id,
                 actor_clearance=user_clearance,
                 limit=limit,

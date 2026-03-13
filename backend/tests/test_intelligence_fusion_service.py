@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -16,17 +17,21 @@ from backend.intelligence_fusion_service import (
     AUTH_CLAIMS_HEADER,
     AUTH_DEFAULT_AUDIENCE,
     AUTH_SIGNATURE_HEADER,
+    AUTH_TOKEN_HEADER,
     ClearanceLevel,
     ConflictOut,
     InMemoryReplayGuard,
     IntelObservationIn,
     IngestResult,
+    JsonLogFormatter,
     PostgresFusionRepository,
+    RecentObservationOut,
     Settings,
     build_auth_claim_headers,
     create_app,
     clearance_allows,
     haversine_distance_m,
+    load_text_value_from_env_or_file,
 )
 
 TEST_AUTH_SECRET = "test-shared-secret"
@@ -37,6 +42,7 @@ class FakeRepository:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.conflicts: list[ConflictOut] = []
+        self.observations: list[RecentObservationOut] = []
         self.last_conflict_clearance: ClearanceLevel | None = None
 
     async def ingest_observation(self, observation, actor_user_id, actor_clearance):
@@ -62,6 +68,15 @@ class FakeRepository:
         self.last_conflict_clearance = actor_clearance
         return self.conflicts[:limit]
 
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
+    ):
+        self.last_conflict_clearance = actor_clearance
+        return self.observations[:limit]
+
 
 class DenyRepository:
     async def ingest_observation(self, observation, actor_user_id, actor_clearance):
@@ -72,6 +87,14 @@ class DenyRepository:
         actor_user_id: str,
         actor_clearance: ClearanceLevel,
         limit: int = 100,
+    ):
+        raise PermissionError("Authenticated actor is inactive.")
+
+    async def recent_observations_for_clearance(
+        self,
+        actor_user_id: str,
+        actor_clearance: ClearanceLevel,
+        limit: int = 200,
     ):
         raise PermissionError("Authenticated actor is inactive.")
 
@@ -116,6 +139,15 @@ def make_auth_headers(
         jti=jti,
         audience=audience,
     )
+
+
+def enable_jwt_runtime_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyJwkClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr("backend.intelligence_fusion_service.jwt", object())
+    monkeypatch.setattr("backend.intelligence_fusion_service.PyJWKClient", DummyJwkClient)
 
 
 def make_request(app, path: str, method: str = "GET") -> Request:
@@ -299,6 +331,57 @@ def test_pending_conflicts_endpoint():
         assert repo.last_conflict_clearance == ClearanceLevel.SECRET
 
 
+def test_recent_observations_endpoint():
+    repo = FakeRepository()
+    repo.observations = [
+        RecentObservationOut(
+            observation_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            target_id="TARGET-99",
+            source_id="SRC-A",
+            source_type="REST_HOOK",
+            classification_marking=ClearanceLevel.SECRET,
+            observed_at=datetime.now(timezone.utc),
+            lat=28.6139,
+            lon=77.2090,
+            unit_type="HOSTILE",
+        )
+    ]
+
+    app = create_app(settings=make_settings(), repository=repo, enable_mqtt=False)
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/observations/recent?limit=10",
+            headers=make_auth_headers(clearance=ClearanceLevel.SECRET),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        assert body[0]["target_id"] == "TARGET-99"
+        assert body[0]["source_id"] == "SRC-A"
+        assert body[0]["unit_type"] == "HOSTILE"
+
+
+def test_recent_observations_returns_403_when_repository_denies_actor():
+    app = create_app(settings=make_settings(), repository=DenyRepository(), enable_mqtt=False)
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/observations/recent?limit=10",
+            headers=make_auth_headers(clearance=ClearanceLevel.TOP_SECRET),
+        )
+        assert response.status_code == 403
+        assert "inactive" in response.json()["detail"].lower()
+
+
+def test_recent_observations_rejects_missing_actor_identity_state():
+    app = create_app(settings=make_settings(), repository=FakeRepository(), enable_mqtt=False)
+    request = make_request(app, "/v1/observations/recent")
+    request.state.user_clearance = ClearanceLevel.TOP_SECRET
+    endpoint = get_route_endpoint(app, "/v1/observations/recent")
+
+    with pytest.raises(HTTPException, match="Missing validated actor identity"):
+        asyncio.run(endpoint(request, limit=10))
+
+
 def test_pending_conflicts_returns_403_when_repository_denies_actor():
     app = create_app(settings=make_settings(), repository=DenyRepository(), enable_mqtt=False)
     with TestClient(app) as client:
@@ -326,6 +409,173 @@ def test_pending_conflicts_requires_authenticated_claims():
         response = client.get("/v1/conflicts/pending?limit=10")
         assert response.status_code == 401
         assert AUTH_CLAIMS_HEADER in response.json()["detail"]
+
+
+def test_jwt_jwks_strategy_accepts_bearer_token(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "jwt-token"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer jwt-token"},
+        )
+        assert response.status_code == 200
+
+
+def test_jwt_jwks_strategy_accepts_x_auth_token_header(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "jwt-token-via-custom-header"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={AUTH_TOKEN_HEADER: "jwt-token-via-custom-header"},
+        )
+        assert response.status_code == 200
+
+
+def test_jwt_jwks_strategy_key_rotation_accepts_old_and_new_tokens(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        token_map = {
+            "old-key-token": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "new-key-token": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        }
+        if token not in token_map:
+            raise ValueError("Invalid bearer token.")
+        return actor_user_id, ClearanceLevel.TOP_SECRET, token_map[token]
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        old_key_response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer old-key-token"},
+        )
+        new_key_response = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer new-key-token"},
+        )
+        assert old_key_response.status_code == 200
+        assert new_key_response.status_code == 200
+
+
+def test_jwt_jwks_strategy_rejects_missing_token_headers(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        response = client.get("/v1/conflicts/pending?limit=10")
+        assert response.status_code == 400
+        assert "bearer token" in response.json()["detail"].lower()
+
+
+def test_jwt_jwks_strategy_allows_bearer_token_reuse_without_replay_rejection(monkeypatch):
+    enable_jwt_runtime_for_tests(monkeypatch)
+    actor_user_id = str(uuid4())
+
+    def fake_verify_token(self, token: str):
+        assert token == "stable-jwt-token"
+        return actor_user_id, ClearanceLevel.TOP_SECRET, "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+    monkeypatch.setattr(
+        "backend.intelligence_fusion_service.JwtJwksAuthValidator.verify_token",
+        fake_verify_token,
+    )
+
+    app = create_app(
+        settings=make_settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        ),
+        repository=FakeRepository(),
+        enable_mqtt=False,
+    )
+    with TestClient(app) as client:
+        first = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer stable-jwt-token"},
+        )
+        second = client.get(
+            "/v1/conflicts/pending?limit=10",
+            headers={"Authorization": "Bearer stable-jwt-token"},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
 
 
 def test_rejects_tampered_auth_signature():
@@ -677,6 +927,57 @@ def test_lifespan_skips_pool_creation_when_repository_is_injected(monkeypatch):
     assert app.state.stop_event.is_set()
 
 
+def test_lifespan_respects_settings_mqtt_enabled(monkeypatch):
+    def fail_create_task(_coro):
+        raise AssertionError("MQTT worker should not be created when MQTT is disabled.")
+
+    monkeypatch.setattr("backend.intelligence_fusion_service.asyncio.create_task", fail_create_task)
+    repo = FakeRepository()
+    app = create_app(settings=make_settings(mqtt_enabled=False), repository=repo)
+
+    with TestClient(app) as client:
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        assert app.state.repository is repo
+
+    assert app.state.stop_event.is_set()
+
+
+def test_metrics_endpoint_exposes_prometheus_metrics_and_request_id():
+    app = create_app(settings=make_settings(), repository=FakeRepository(), enable_mqtt=False)
+
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.headers["X-Request-ID"]
+
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "shakti_http_requests_total" in metrics.text
+        assert "shakti_http_request_duration_seconds" in metrics.text
+        assert "shakti_db_operations_total" in metrics.text
+
+
+def test_json_log_formatter_emits_structured_payload():
+    formatter = JsonLogFormatter()
+    record = logging.makeLogRecord(
+        {
+            "name": "shakti.intelligence_fusion",
+            "levelno": logging.INFO,
+            "levelname": "INFO",
+            "msg": "request_completed",
+            "request_id": "req-123",
+            "status_code": 200,
+        }
+    )
+
+    payload = json.loads(formatter.format(record))
+    assert payload["message"] == "request_completed"
+    assert payload["request_id"] == "req-123"
+    assert payload["status_code"] == 200
+    assert payload["level"] == "INFO"
+
+
 def test_settings_rejects_invalid_mqtt_service_user_id():
     with pytest.raises(ValueError, match="actor_user_id must be a valid UUID"):
         Settings(mqtt_service_user_id="not-a-uuid")
@@ -695,6 +996,35 @@ def test_settings_rejects_invalid_auth_replay_ttl_seconds():
 def test_settings_rejects_invalid_auth_max_claims_bytes():
     with pytest.raises(ValueError, match="AUTH_MAX_CLAIMS_BYTES must be at least 256 bytes"):
         Settings(auth_max_claims_bytes=255)
+
+
+def test_settings_rejects_invalid_auth_strategy():
+    with pytest.raises(ValueError, match="AUTH_STRATEGY must be either"):
+        Settings(auth_strategy="invalid-auth-strategy")
+
+
+def test_settings_rejects_jwt_jwks_strategy_without_jwks_url():
+    with pytest.raises(ValueError, match="AUTH_JWKS_URL must be set"):
+        Settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="",
+            auth_jwt_issuer="https://issuer.example/",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        )
+
+
+def test_settings_rejects_jwt_jwks_strategy_without_issuer():
+    with pytest.raises(ValueError, match="AUTH_JWT_ISSUER must be set"):
+        Settings(
+            auth_strategy="jwt_jwks",
+            auth_jwks_url="https://issuer.example/.well-known/jwks.json",
+            auth_jwt_issuer="",
+            auth_jwt_audience=AUTH_DEFAULT_AUDIENCE,
+            auth_shared_secret_primary="",
+            auth_shared_secret_secondary="",
+        )
 
 
 def test_settings_rejects_invalid_api_rate_limit_requests():
@@ -721,3 +1051,61 @@ def test_settings_rejects_partial_mqtt_client_cert_configuration():
         ValueError, match="MQTT_TLS_CERT_FILE and MQTT_TLS_KEY_FILE must be provided together"
     ):
         Settings(mqtt_tls_cert_file="/tmp/client.crt", mqtt_tls_key_file="")
+
+
+def test_settings_rejects_invalid_log_level():
+    with pytest.raises(ValueError, match="LOG_LEVEL must be a valid Python logging level"):
+        Settings(log_level="LOUD")
+
+
+def test_settings_rejects_invalid_db_slow_query_threshold():
+    with pytest.raises(ValueError, match="DB_SLOW_QUERY_THRESHOLD_MS must be a positive number"):
+        Settings(db_slow_query_threshold_ms=0)
+
+
+def test_load_text_value_from_env_or_file_reads_secret_file(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("file-backed-secret\n", encoding="utf-8")
+    monkeypatch.delenv("AUTH_SHARED_SECRET_PRIMARY", raising=False)
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    assert (
+        load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY")
+        == "file-backed-secret"
+    )
+
+
+def test_load_text_value_from_env_or_file_rejects_conflicting_sources(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("file-backed-secret\n", encoding="utf-8")
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY", "env-secret")
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    with pytest.raises(
+        ValueError,
+        match="AUTH_SHARED_SECRET_PRIMARY and AUTH_SHARED_SECRET_PRIMARY_FILE cannot both be set",
+    ):
+        load_text_value_from_env_or_file("AUTH_SHARED_SECRET_PRIMARY")
+
+
+def test_settings_loads_primary_auth_secret_from_file(tmp_path, monkeypatch):
+    secret_path = tmp_path / "auth_primary"
+    secret_path.write_text("rotated-primary\n", encoding="utf-8")
+    monkeypatch.delenv("AUTH_SHARED_SECRET_PRIMARY", raising=False)
+    monkeypatch.delenv("AUTH_SHARED_SECRET", raising=False)
+    monkeypatch.setenv("AUTH_SHARED_SECRET_PRIMARY_FILE", str(secret_path))
+
+    settings = Settings()
+
+    assert settings.auth_shared_secret_primary == "rotated-primary"
+
+
+def test_settings_loads_pg_dsn_from_file(tmp_path, monkeypatch):
+    dsn_path = tmp_path / "pg_dsn"
+    dsn_path.write_text("postgresql://shakti:file@db.internal:5432/shakti\n", encoding="utf-8")
+    monkeypatch.delenv("PG_DSN", raising=False)
+    monkeypatch.setenv("PG_DSN_FILE", str(dsn_path))
+
+    settings = Settings()
+
+    assert settings.pg_dsn == "postgresql://shakti:file@db.internal:5432/shakti"

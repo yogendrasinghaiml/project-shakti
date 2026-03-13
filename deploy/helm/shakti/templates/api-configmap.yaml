@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "shakti.fullname" . }}-config
+  labels:
+    {{- include "shakti.labels" . | nindent 4 }}
+data:
+  LOG_JSON: {{ ternary "true" "false" .Values.env.logJson | quote }}
+  LOG_LEVEL: {{ .Values.env.logLevel | quote }}
+  DB_SLOW_QUERY_THRESHOLD_MS: {{ .Values.env.dbSlowQueryThresholdMs | quote }}
+  MAX_INGEST_BYTES: {{ .Values.env.maxIngestBytes | quote }}
+  API_RATE_LIMIT_ENABLED: {{ ternary "true" "false" .Values.env.apiRateLimitEnabled | quote }}
+  API_RATE_LIMIT_REQUIRE_PERSISTENT: {{ ternary "true" "false" .Values.env.apiRateLimitRequirePersistent | quote }}
+  API_RATE_LIMIT_REQUESTS: {{ .Values.env.apiRateLimitRequests | quote }}
+  API_RATE_LIMIT_WINDOW_SECONDS: {{ .Values.env.apiRateLimitWindowSeconds | quote }}
+  MQTT_ENABLED: {{ ternary "true" "false" .Values.env.mqttEnabled | quote }}
+  MQTT_REQUIRE_AUTH: {{ ternary "true" "false" .Values.env.mqttRequireAuth | quote }}
+  MQTT_REQUIRE_TLS: {{ ternary "true" "false" .Values.env.mqttRequireTls | quote }}
+  SHAKTI_DB_MIGRATION_MODE: {{ .Values.env.migrationMode | quote }}
+  SHAKTI_DB_WAIT_TIMEOUT_SECONDS: {{ .Values.env.dbWaitTimeoutSeconds | quote }}
+  AUTH_STRATEGY: {{ .Values.env.authStrategy | quote }}
+  AUTH_EXPECTED_AUDIENCE: {{ .Values.env.authExpectedAudience | quote }}
+  AUTH_JWKS_URL: {{ .Values.env.authJwksUrl | quote }}
+  AUTH_JWT_ISSUER: {{ .Values.env.authJwtIssuer | quote }}
+  AUTH_JWT_AUDIENCE: {{ .Values.env.authJwtAudience | quote }}
+  AUTH_JWT_ALGORITHMS: {{ .Values.env.authJwtAlgorithms | quote }}
+  AUTH_MAX_SKEW_SECONDS: {{ .Values.env.authMaxSkewSeconds | quote }}
+  AUTH_REPLAY_TTL_SECONDS: {{ .Values.env.authReplayTtlSeconds | quote }}
+  AUTH_MAX_CLAIMS_BYTES: {{ .Values.env.authMaxClaimsBytes | quote }}
+  AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD: {{ ternary "true" "false" .Values.env.authRequirePersistentReplayGuard | quote }}
+  {{- range $key, $value := .Values.env.extra }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

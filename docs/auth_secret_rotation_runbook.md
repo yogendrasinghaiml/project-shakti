@@ -6,6 +6,8 @@ This runbook defines how to rotate shared secrets used for signed gateway auth c
 
 - `AUTH_SHARED_SECRET_PRIMARY`
 - `AUTH_SHARED_SECRET_SECONDARY`
+- `AUTH_SHARED_SECRET_PRIMARY_FILE`
+- `AUTH_SHARED_SECRET_SECONDARY_FILE`
 - `AUTH_SHARED_SECRETS_FILE` (JSON source of `primary` and `secondary`)
 
 It also defines replay-guard requirements for production deployments.
@@ -14,7 +16,7 @@ It also defines replay-guard requirements for production deployments.
 
 1. Persistent replay guard must be enabled:
    - `AUTH_REQUIRE_PERSISTENT_REPLAY_GUARD=true`
-2. Database migration including `auth_claim_replay_guard` must be applied.
+2. Database migration including `auth_claim_replay_guard` must be applied (`python ops/db/migrate.py up`).
 3. Gateway and service clocks must be NTP-synchronized.
 4. New secret must be generated from a CSPRNG and stored in a secret manager.
 
@@ -80,4 +82,3 @@ Rules:
    - Replay detected
 2. Alert if replay-guard table growth exceeds expected TTL behavior.
 3. Periodically prune/monitor `auth_claim_replay_guard` index health.
-
