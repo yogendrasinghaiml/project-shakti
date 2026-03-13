@@ -28,7 +28,13 @@ Key services:
 
 - `api` scrapes its own `/metrics` endpoint
 - `postgres-exporter` exposes PostgreSQL metrics to Prometheus
+- Prometheus loads alert rules from `ops/staging/prometheus/alerts.yml`
 - Grafana auto-loads the starter `SHAKTI Staging Overview` dashboard
+
+Backup and restore scripts:
+
+- `./ops/db/backup_postgres.sh --env-file .env.staging`
+- `./ops/db/restore_postgres.sh --env-file .env.staging --backup-file ops/staging/backups/<backup>.dump --yes`
 
 Shutdown:
 

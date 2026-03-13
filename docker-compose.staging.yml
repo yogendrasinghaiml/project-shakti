@@ -61,6 +61,7 @@ services:
       - "${PROMETHEUS_PORT:-19090}:9090"
     volumes:
       - ./ops/staging/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/staging/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_staging_data:/prometheus
     restart: unless-stopped
 

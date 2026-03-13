@@ -71,6 +71,25 @@ python ops/db/migrate.py down --steps 1
 
 By default, local Docker uses `SHAKTI_DB_MIGRATION_MODE=auto` so pending migrations are applied automatically at startup.
 
+## Backup And Restore
+
+Staging backup:
+
+```bash
+./ops/db/backup_postgres.sh --env-file .env.staging
+```
+
+Staging restore:
+
+```bash
+./ops/db/restore_postgres.sh --env-file .env.staging --backup-file ops/staging/backups/<backup>.dump --yes
+```
+
+Runbook and drill checklist:
+
+- `docs/backup_restore_runbook.md`
+- `docs/restore_drill_checklist.md`
+
 ## Staging
 
 Use the staging override plus the published GHCR image:
@@ -84,7 +103,7 @@ docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.s
 docker compose --env-file .env.staging -f docker-compose.yml -f docker-compose.staging.yml up -d
 ```
 
-This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
+This adds Prometheus, Grafana, and PostgreSQL exporter around the API. Staging defaults to `SHAKTI_DB_MIGRATION_MODE=verify`, so API boot fails fast if migrations drift or are pending. Alert rules are defined in `ops/staging/prometheus/alerts.yml`. The starter dashboard, scrape config, and staging secret contract live under `ops/staging/`.
 
 ## Production Plan
 

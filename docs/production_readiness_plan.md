@@ -19,10 +19,10 @@ This checklist tracks the remaining work to move SHAKTI from staging-grade to pr
 
 ## Phase 3: Backup, Restore, DR, And Alerting
 
-- [ ] Add PostgreSQL backup and restore scripts
-- [ ] Add recovery-point and recovery-time objectives to runbooks
-- [ ] Add Prometheus alert rules for API failures, latency, and database health
-- [ ] Add a restore drill checklist
+- [x] Add PostgreSQL backup and restore scripts
+- [x] Add recovery-point and recovery-time objectives to runbooks
+- [x] Add Prometheus alert rules for API failures, latency, and database health
+- [x] Add a restore drill checklist
 
 ## Phase 4: Load Testing And Capacity Limits
 

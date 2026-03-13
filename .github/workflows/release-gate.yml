@@ -69,6 +69,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements-ci.txt
 
+      - name: Ops script syntax check
+        run: |
+          bash -n ops/db/backup_postgres.sh
+          bash -n ops/db/restore_postgres.sh
+          bash -n ops/docker-entrypoint.sh
+
       - name: Secret hygiene scan
         run: |
           python - <<'PY'
@@ -155,6 +161,9 @@ jobs:
 
       - name: Staging compose render validation
         run: docker compose --env-file ops/staging/staging.env.example -f docker-compose.yml -f docker-compose.staging.yml config > /tmp/project-shakti-staging.compose.yaml
+
+      - name: Prometheus alert rules validation
+        run: docker run --rm -i --entrypoint sh prom/prometheus:v2.54.1 -c 'cat > /tmp/alerts.yml && promtool check rules /tmp/alerts.yml' < ops/staging/prometheus/alerts.yml
 
       - name: Container build
         run: docker build -t project-shakti-api .
